@@ -29,7 +29,11 @@ typedef struct controller_state {
     int max_parallel;
     int current_running;
     int shutdown_requested;
+    int shutdown_ack_pending;
     char policy[32];
+    int has_last_user;
+    int last_user_id;
+    char shutdown_reply_fifo[RUNNER_FIFO_PATH_MAX];
     job_t *scheduled_head;
     job_t *scheduled_tail;
     job_t *executing_head;
@@ -52,25 +56,53 @@ static void safe_write_text(int fd, const char *text) {
 static void usage(void) {
     safe_write_text(
         STDERR_FILENO,
-        "usage: ./controller <parallel-commands> <sched-policy>\n");
+        "usage: ./controller <parallel-commands> <sched-policy>\n"
+        "  sched-policy: FCFS | RR_USER\n");
+}
+
+static int is_valid_policy(const char *policy) {
+    return strcmp(policy, "FCFS") == 0 || strcmp(policy, "RR_USER") == 0 ||
+           strcmp(policy, "RR-U") == 0;
+}
+
+static int write_full(int fd, const void *buf, size_t len) {
+    const char *p;
+    size_t total;
+
+    p = (const char *)buf;
+    total = 0;
+    while (total < len) {
+        ssize_t n;
+        n = write(fd, p + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+
+    return 0;
 }
 
 static int send_response(const char *fifo_path, const response_t *resp) {
     int fd;
-    ssize_t written;
 
     fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         return -1;
     }
 
-    written = write(fd, resp, sizeof(*resp));
-    close(fd);
-
-    if (written != (ssize_t)sizeof(*resp)) {
+    if (write_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
         return -1;
     }
 
+    close(fd);
     return 0;
 }
 
@@ -104,7 +136,7 @@ static void enqueue_scheduled(controller_state_t *state, job_t *job) {
     state->scheduled_tail = job;
 }
 
-static job_t *dequeue_scheduled(controller_state_t *state) {
+static job_t *dequeue_scheduled_head(controller_state_t *state) {
     job_t *job;
 
     job = state->scheduled_head;
@@ -118,6 +150,57 @@ static job_t *dequeue_scheduled(controller_state_t *state) {
     }
     job->next = NULL;
     return job;
+}
+
+static int is_rr_user_policy(const controller_state_t *state) {
+    return strcmp(state->policy, "RR_USER") == 0 ||
+           strcmp(state->policy, "RR-U") == 0;
+}
+
+static job_t *dequeue_scheduled_rr_user(controller_state_t *state) {
+    job_t *prev;
+    job_t *cur;
+    job_t *pick_prev;
+    job_t *pick;
+
+    prev = NULL;
+    cur = state->scheduled_head;
+    pick_prev = NULL;
+    pick = NULL;
+
+    while (cur != NULL) {
+        if (!state->has_last_user || cur->user_id != state->last_user_id) {
+            pick_prev = prev;
+            pick = cur;
+            break;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (pick == NULL) {
+        return dequeue_scheduled_head(state);
+    }
+
+    if (pick_prev == NULL) {
+        state->scheduled_head = pick->next;
+    } else {
+        pick_prev->next = pick->next;
+    }
+
+    if (pick == state->scheduled_tail) {
+        state->scheduled_tail = pick_prev;
+    }
+
+    pick->next = NULL;
+    return pick;
+}
+
+static job_t *dequeue_next_scheduled(controller_state_t *state) {
+    if (is_rr_user_policy(state)) {
+        return dequeue_scheduled_rr_user(state);
+    }
+    return dequeue_scheduled_head(state);
 }
 
 static void add_executing(controller_state_t *state, job_t *job) {
@@ -134,14 +217,26 @@ static long long elapsed_ms(const struct timeval *start, const struct timeval *e
     return secs * 1000LL + usecs / 1000LL;
 }
 
+static long long epoch_ms(const struct timeval *ts) {
+    return (long long)ts->tv_sec * 1000LL + (long long)ts->tv_usec / 1000LL;
+}
+
 static void log_finished_job(const job_t *job) {
     int fd;
     struct timeval end_ts;
     char line[512];
     int len;
+    long long submit_ms;
+    long long start_ms;
+    long long end_ms;
+    long long wait_ms;
     long long total_ms;
 
     gettimeofday(&end_ts, NULL);
+    submit_ms = epoch_ms(&job->submit_ts);
+    start_ms = epoch_ms(&job->start_ts);
+    end_ms = epoch_ms(&end_ts);
+    wait_ms = elapsed_ms(&job->submit_ts, &job->start_ts);
     total_ms = elapsed_ms(&job->submit_ts, &end_ts);
 
     fd = open("tmp/executions.log", O_CREAT | O_WRONLY | O_APPEND, 0644);
@@ -151,9 +246,13 @@ static void log_finished_job(const job_t *job) {
 
     len = snprintf(line,
                    sizeof(line),
-                   "%d,%lu,%lld\n",
+                   "%d,%lu,%lld,%lld,%lld,%lld,%lld\n",
                    job->user_id,
                    job->command_id,
+                   submit_ms,
+                   start_ms,
+                   end_ms,
+                   wait_ms,
                    total_ms);
     if (len > 0) {
         (void)write(fd, line, (size_t)len);
@@ -224,7 +323,7 @@ static void schedule_jobs(controller_state_t *state) {
     response_t resp;
 
     while (state->current_running < state->max_parallel) {
-        job = dequeue_scheduled(state);
+        job = dequeue_next_scheduled(state);
         if (job == NULL) {
             return;
         }
@@ -232,6 +331,8 @@ static void schedule_jobs(controller_state_t *state) {
         gettimeofday(&job->start_ts, NULL);
         add_executing(state, job);
         state->current_running++;
+        state->has_last_user = 1;
+        state->last_user_id = job->user_id;
 
         memset(&resp, 0, sizeof(resp));
         resp.type = MSG_START;
@@ -267,12 +368,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     strncpy(state.policy, argv[2], sizeof(state.policy) - 1);
+    if (!is_valid_policy(state.policy)) {
+        safe_write_text(STDERR_FILENO, "invalid sched-policy. use FCFS or RR_USER\n");
+        return 1;
+    }
 
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
         perror("sigaction");
+        return 1;
+    }
+
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        perror("signal SIGPIPE");
         return 1;
     }
 
@@ -306,6 +416,13 @@ int main(int argc, char **argv) {
 
         schedule_jobs(&state);
         if (can_exit(&state)) {
+            if (state.shutdown_ack_pending) {
+                response_t ack;
+                memset(&ack, 0, sizeof(ack));
+                ack.type = MSG_SHUTDOWN_ACK;
+                ack.ok = 1;
+                (void)send_response(state.shutdown_reply_fifo, &ack);
+            }
             break;
         }
 
@@ -374,13 +491,11 @@ int main(int argc, char **argv) {
                 build_status_response(&state, &status);
                 (void)send_response(msg.reply_fifo, &status);
             } else if (msg.type == MSG_SHUTDOWN_REQ) {
-                response_t ack;
-
                 state.shutdown_requested = 1;
-                memset(&ack, 0, sizeof(ack));
-                ack.type = MSG_SHUTDOWN_ACK;
-                ack.ok = 1;
-                (void)send_response(msg.reply_fifo, &ack);
+                state.shutdown_ack_pending = 1;
+                strncpy(state.shutdown_reply_fifo,
+                        msg.reply_fifo,
+                        sizeof(state.shutdown_reply_fifo) - 1);
             }
         }
     }

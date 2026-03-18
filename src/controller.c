@@ -1,0 +1,394 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include "protocol.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+typedef struct job {
+    int user_id;
+    unsigned long command_id;
+    pid_t runner_pid;
+    char reply_fifo[RUNNER_FIFO_PATH_MAX];
+    char command[COMMAND_TEXT_MAX];
+    struct timeval submit_ts;
+    struct timeval start_ts;
+    struct job *next;
+} job_t;
+
+typedef struct controller_state {
+    int max_parallel;
+    int current_running;
+    int shutdown_requested;
+    char policy[32];
+    job_t *scheduled_head;
+    job_t *scheduled_tail;
+    job_t *executing_head;
+} controller_state_t;
+
+static volatile sig_atomic_t g_stop_signal = 0;
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_stop_signal = 1;
+}
+
+static void safe_write_text(int fd, const char *text) {
+    if (text == NULL) {
+        return;
+    }
+    (void)write(fd, text, strlen(text));
+}
+
+static void usage(void) {
+    safe_write_text(
+        STDERR_FILENO,
+        "usage: ./controller <parallel-commands> <sched-policy>\n");
+}
+
+static int send_response(const char *fifo_path, const response_t *resp) {
+    int fd;
+    ssize_t written;
+
+    fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return -1;
+    }
+
+    written = write(fd, resp, sizeof(*resp));
+    close(fd);
+
+    if (written != (ssize_t)sizeof(*resp)) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static job_t *create_job(const message_t *msg) {
+    job_t *job;
+
+    job = (job_t *)calloc(1, sizeof(*job));
+    if (job == NULL) {
+        return NULL;
+    }
+
+    job->user_id = msg->user_id;
+    job->command_id = msg->command_id;
+    job->runner_pid = msg->runner_pid;
+    strncpy(job->reply_fifo, msg->reply_fifo, sizeof(job->reply_fifo) - 1);
+    strncpy(job->command, msg->command, sizeof(job->command) - 1);
+    gettimeofday(&job->submit_ts, NULL);
+    job->next = NULL;
+
+    return job;
+}
+
+static void enqueue_scheduled(controller_state_t *state, job_t *job) {
+    if (state->scheduled_tail == NULL) {
+        state->scheduled_head = job;
+        state->scheduled_tail = job;
+        return;
+    }
+
+    state->scheduled_tail->next = job;
+    state->scheduled_tail = job;
+}
+
+static job_t *dequeue_scheduled(controller_state_t *state) {
+    job_t *job;
+
+    job = state->scheduled_head;
+    if (job == NULL) {
+        return NULL;
+    }
+
+    state->scheduled_head = job->next;
+    if (state->scheduled_head == NULL) {
+        state->scheduled_tail = NULL;
+    }
+    job->next = NULL;
+    return job;
+}
+
+static void add_executing(controller_state_t *state, job_t *job) {
+    job->next = state->executing_head;
+    state->executing_head = job;
+}
+
+static long long elapsed_ms(const struct timeval *start, const struct timeval *end) {
+    long long secs;
+    long long usecs;
+
+    secs = (long long)(end->tv_sec - start->tv_sec);
+    usecs = (long long)(end->tv_usec - start->tv_usec);
+    return secs * 1000LL + usecs / 1000LL;
+}
+
+static void log_finished_job(const job_t *job) {
+    int fd;
+    struct timeval end_ts;
+    char line[512];
+    int len;
+    long long total_ms;
+
+    gettimeofday(&end_ts, NULL);
+    total_ms = elapsed_ms(&job->submit_ts, &end_ts);
+
+    fd = open("tmp/executions.log", O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) {
+        return;
+    }
+
+    len = snprintf(line,
+                   sizeof(line),
+                   "%d,%lu,%lld\n",
+                   job->user_id,
+                   job->command_id,
+                   total_ms);
+    if (len > 0) {
+        (void)write(fd, line, (size_t)len);
+    }
+
+    close(fd);
+}
+
+static int finish_executing(controller_state_t *state, int user_id, unsigned long command_id) {
+    job_t *prev;
+    job_t *cur;
+
+    prev = NULL;
+    cur = state->executing_head;
+    while (cur != NULL) {
+        if (cur->user_id == user_id && cur->command_id == command_id) {
+            if (prev == NULL) {
+                state->executing_head = cur->next;
+            } else {
+                prev->next = cur->next;
+            }
+
+            if (state->current_running > 0) {
+                state->current_running--;
+            }
+            log_finished_job(cur);
+            free(cur);
+            return 0;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    return -1;
+}
+
+static void build_status_response(const controller_state_t *state, response_t *resp) {
+    const job_t *cur;
+    int i;
+
+    memset(resp, 0, sizeof(*resp));
+    resp->type = MSG_STATUS_RESP;
+    resp->ok = 1;
+
+    i = 0;
+    cur = state->executing_head;
+    while (cur != NULL && i < STATUS_MAX_ITEMS) {
+        resp->executing[i].user_id = cur->user_id;
+        resp->executing[i].command_id = cur->command_id;
+        i++;
+        cur = cur->next;
+    }
+    resp->executing_count = i;
+
+    i = 0;
+    cur = state->scheduled_head;
+    while (cur != NULL && i < STATUS_MAX_ITEMS) {
+        resp->scheduled[i].user_id = cur->user_id;
+        resp->scheduled[i].command_id = cur->command_id;
+        i++;
+        cur = cur->next;
+    }
+    resp->scheduled_count = i;
+}
+
+static void schedule_jobs(controller_state_t *state) {
+    job_t *job;
+    response_t resp;
+
+    while (state->current_running < state->max_parallel) {
+        job = dequeue_scheduled(state);
+        if (job == NULL) {
+            return;
+        }
+
+        gettimeofday(&job->start_ts, NULL);
+        add_executing(state, job);
+        state->current_running++;
+
+        memset(&resp, 0, sizeof(resp));
+        resp.type = MSG_START;
+        resp.ok = 1;
+        if (send_response(job->reply_fifo, &resp) != 0) {
+            /* If the runner is gone, free the slot to keep controller healthy. */
+            (void)finish_executing(state, job->user_id, job->command_id);
+        }
+    }
+}
+
+static int can_exit(const controller_state_t *state) {
+    return state->shutdown_requested && state->current_running == 0 &&
+           state->scheduled_head == NULL;
+}
+
+int main(int argc, char **argv) {
+    controller_state_t state;
+    struct sigaction sa;
+    int request_fd;
+    struct pollfd pfd;
+    int fifo_keepalive_fd;
+
+    if (argc != 3) {
+        usage();
+        return 1;
+    }
+
+    memset(&state, 0, sizeof(state));
+    state.max_parallel = atoi(argv[1]);
+    if (state.max_parallel <= 0) {
+        safe_write_text(STDERR_FILENO, "invalid parallel-commands value\n");
+        return 1;
+    }
+    strncpy(state.policy, argv[2], sizeof(state.policy) - 1);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
+        perror("sigaction");
+        return 1;
+    }
+
+    unlink(CONTROLLER_FIFO_PATH);
+    if (mkfifo(CONTROLLER_FIFO_PATH, 0666) < 0) {
+        perror("mkfifo controller");
+        return 1;
+    }
+
+    request_fd = open(CONTROLLER_FIFO_PATH, O_RDONLY | O_NONBLOCK);
+    if (request_fd < 0) {
+        perror("open controller fifo");
+        unlink(CONTROLLER_FIFO_PATH);
+        return 1;
+    }
+
+    fifo_keepalive_fd = open(CONTROLLER_FIFO_PATH, O_WRONLY | O_NONBLOCK);
+    if (fifo_keepalive_fd < 0 && errno != ENXIO) {
+        perror("open fifo keepalive");
+    }
+
+    pfd.fd = request_fd;
+    pfd.events = POLLIN;
+
+    while (1) {
+        int pr;
+
+        if (g_stop_signal) {
+            state.shutdown_requested = 1;
+        }
+
+        schedule_jobs(&state);
+        if (can_exit(&state)) {
+            break;
+        }
+
+        pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            break;
+        }
+
+        if (pr == 0 || (pfd.revents & POLLIN) == 0) {
+            continue;
+        }
+
+        while (1) {
+            message_t msg;
+            ssize_t n;
+
+            n = read(request_fd, &msg, sizeof(msg));
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                perror("read request");
+                break;
+            }
+
+            if (n == 0) {
+                break;
+            }
+
+            if (n != (ssize_t)sizeof(msg)) {
+                continue;
+            }
+
+            if (msg.type == MSG_SUBMIT) {
+                job_t *job;
+                response_t err_resp;
+
+                if (state.shutdown_requested) {
+                    memset(&err_resp, 0, sizeof(err_resp));
+                    err_resp.type = MSG_ERROR;
+                    err_resp.ok = 0;
+                    strncpy(err_resp.info, "controller shutting down", sizeof(err_resp.info) - 1);
+                    (void)send_response(msg.reply_fifo, &err_resp);
+                    continue;
+                }
+
+                job = create_job(&msg);
+                if (job == NULL) {
+                    memset(&err_resp, 0, sizeof(err_resp));
+                    err_resp.type = MSG_ERROR;
+                    err_resp.ok = 0;
+                    strncpy(err_resp.info, "controller out of memory", sizeof(err_resp.info) - 1);
+                    (void)send_response(msg.reply_fifo, &err_resp);
+                    continue;
+                }
+
+                enqueue_scheduled(&state, job);
+            } else if (msg.type == MSG_FINISH) {
+                (void)finish_executing(&state, msg.user_id, msg.command_id);
+            } else if (msg.type == MSG_STATUS_REQ) {
+                response_t status;
+                build_status_response(&state, &status);
+                (void)send_response(msg.reply_fifo, &status);
+            } else if (msg.type == MSG_SHUTDOWN_REQ) {
+                response_t ack;
+
+                state.shutdown_requested = 1;
+                memset(&ack, 0, sizeof(ack));
+                ack.type = MSG_SHUTDOWN_ACK;
+                ack.ok = 1;
+                (void)send_response(msg.reply_fifo, &ack);
+            }
+        }
+    }
+
+    close(request_fd);
+    if (fifo_keepalive_fd >= 0) {
+        close(fifo_keepalive_fd);
+    }
+    unlink(CONTROLLER_FIFO_PATH);
+    return 0;
+}

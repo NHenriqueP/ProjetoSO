@@ -2,7 +2,7 @@
 
 # Simple end-to-end test
 
-PROJ_DIR="/home/cerqueira/UNI/SO/projeto/ProjetoSO"
+PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJ_DIR"
 
 # Kill any old processes
@@ -11,7 +11,7 @@ killall -9 runner 2>/dev/null || true
 sleep 1
 
 # Clean up old FIFOs and logs
-find /tmp -name "so_*.fifo" -delete 2>/dev/null || true
+echo "(skipping FIFO cleanup)"
 
 echo "=== Starting Controller (1 parallel, FCFS) ==="
 ./bin/controller 1 FCFS &

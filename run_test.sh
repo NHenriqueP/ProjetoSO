@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-cd /home/cerqueira/UNI/SO/projeto/ProjetoSO
+PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJ_DIR"
 
 echo "=== Building ==="
 make clean >/dev/null 2>&1
@@ -9,8 +10,8 @@ make >/dev/null 2>&1
 
 echo "=== Killing old processes ==="
 killall -9 controller runner 2>/dev/null || true
-cd /tmp && find . -name "so_*.fifo" -delete 2>/dev/null || true
-cd /home/cerqueira/UNI/SO/projeto/ProjetoSO
+echo "(skipping FIFO cleanup)"
+cd "$PROJ_DIR"
 sleep 1
 
 echo "=== Starting controller (1 parallel, FCFS) ==="

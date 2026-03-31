@@ -20,9 +20,46 @@ static void print_usage(void) {
     (void)write(STDERR_FILENO, msg, strlen(msg));
 }
 
+static int write_full(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = write(fd, p + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+    return 0;
+}
+
+static int read_full(int fd, void *buf, size_t len) {
+    char *p = (char *)buf;
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, p + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+    return 0;
+}
+
 static int write_request(const message_t *msg) {
     int fd;
-    ssize_t n;
 
     fd = open(CONTROLLER_FIFO_PATH, O_WRONLY);
     if (fd < 0) {
@@ -30,32 +67,13 @@ static int write_request(const message_t *msg) {
         return -1;
     }
 
-    n = write(fd, msg, sizeof(*msg));
-    close(fd);
-    if (n != (ssize_t)sizeof(*msg)) {
+    if (write_full(fd, msg, sizeof(*msg)) != 0) {
+        close(fd);
         perror("write controller fifo");
         return -1;
     }
 
-    return 0;
-}
-
-static int read_response(const char *fifo_path, response_t *resp) {
-    int fd;
-    ssize_t n;
-
-    fd = open(fifo_path, O_RDONLY);
-    if (fd < 0) {
-        perror("open reply fifo");
-        return -1;
-    }
-
-    n = read(fd, resp, sizeof(*resp));
     close(fd);
-    if (n != (ssize_t)sizeof(*resp)) {
-        perror("read reply fifo");
-        return -1;
-    }
 
     return 0;
 }
@@ -75,19 +93,32 @@ static int do_status_or_shutdown(int is_shutdown) {
         return 1;
     }
 
+    /* Open RDWR to prevent EOF before controller opens for writing. */
+    int reply_fd = open(fifo_path, O_RDWR);
+    if (reply_fd < 0) {
+        perror("open reply fifo");
+        unlink(fifo_path);
+        return 1;
+    }
+
     req.type = is_shutdown ? MSG_SHUTDOWN_REQ : MSG_STATUS_REQ;
     req.runner_pid = getpid();
     strncpy(req.reply_fifo, fifo_path, sizeof(req.reply_fifo) - 1);
 
     if (write_request(&req) != 0) {
+        close(reply_fd);
         unlink(fifo_path);
         return 1;
     }
 
-    if (read_response(fifo_path, &resp) != 0) {
+    if (read_full(reply_fd, &resp, sizeof(resp)) != 0) {
+        perror("read reply fifo");
+        close(reply_fd);
         unlink(fifo_path);
         return 1;
     }
+
+    close(reply_fd);
 
     if (is_shutdown) {
         dprintf(STDOUT_FILENO, "shutdown_ack: ok=%d\n", resp.ok);
@@ -132,6 +163,14 @@ static int do_submit(int user_id, unsigned long command_id, int sleep_seconds) {
         return 1;
     }
 
+    /* Open RDWR to prevent EOF before controller opens for writing. */
+    int reply_fd = open(fifo_path, O_RDWR);
+    if (reply_fd < 0) {
+        perror("open reply fifo");
+        unlink(fifo_path);
+        return 1;
+    }
+
     req.type = MSG_SUBMIT;
     req.user_id = user_id;
     req.command_id = command_id;
@@ -140,14 +179,19 @@ static int do_submit(int user_id, unsigned long command_id, int sleep_seconds) {
     strncpy(req.command, "fake-command", sizeof(req.command) - 1);
 
     if (write_request(&req) != 0) {
+        close(reply_fd);
         unlink(fifo_path);
         return 1;
     }
 
-    if (read_response(fifo_path, &resp) != 0) {
+    if (read_full(reply_fd, &resp, sizeof(resp)) != 0) {
+        perror("read reply fifo");
+        close(reply_fd);
         unlink(fifo_path);
         return 1;
     }
+
+    close(reply_fd);
 
     if (resp.type != MSG_START || !resp.ok) {
         dprintf(STDERR_FILENO,

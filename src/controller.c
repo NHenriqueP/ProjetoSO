@@ -92,7 +92,11 @@ static int write_full(int fd, const void *buf, size_t len) {
 static int send_response(const char *fifo_path, const response_t *resp) {
     int fd;
 
-    fd = open(fifo_path, O_WRONLY);
+    /*
+     * Open non-blocking to ensure the controller never gets stuck on a misbehaving runner.
+     * Runners should open their reply FIFO in O_RDWR mode before sending a request.
+     */
+    fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         return -1;
     }

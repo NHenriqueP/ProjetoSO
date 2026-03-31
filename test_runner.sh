@@ -31,12 +31,13 @@ sleep 0.5
 echo ""
 echo "Test 2: User 2 executes 'sleep 1'"
 ./bin/runner -e 2 "sleep 1" &
+SLEEP_RUNNER_PID=$!
 sleep 0.5
 
 echo "Test 3: User 1 executes 'date'"
 ./bin/runner -e 1 "date"
 
-wait
+wait "$SLEEP_RUNNER_PID"
 
 sleep 1
 
@@ -49,6 +50,9 @@ sleep 1
 echo ""
 echo "====== Shutting down controller ======"
 ./bin/runner -s || true
+
+# Wait for controller to actually exit.
+wait "$CONTROLLER_PID" 2>/dev/null || true
 
 sleep 2
 

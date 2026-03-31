@@ -4,16 +4,24 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 /* Global command counter for unique IDs */
 static unsigned long g_command_id = 0;
+static volatile sig_atomic_t g_stop_signal = 0;
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_stop_signal = 1;
+}
 
 static void print_usage(void) {
     fprintf(stderr, "Usage:\n");
@@ -30,11 +38,8 @@ static void print_info(const char *msg) {
     fprintf(stdout, "INFO: %s\n", msg);
 }
 
-static char *generate_fifo_path(pid_t pid) {
-    static char path[RUNNER_FIFO_PATH_MAX];
-    snprintf(path, sizeof(path), "/tmp/so_runner_%d_%lu.fifo", pid, 
-             (unsigned long)time(NULL) * 1000000 + g_command_id++);
-    return path;
+static void generate_fifo_path(pid_t pid, unsigned long cmd_id, char *buffer, size_t bufsize) {
+    snprintf(buffer, bufsize, "/tmp/so_runner_%d_%lu.fifo", pid, cmd_id);
 }
 
 static int send_message(const message_t *msg) {
@@ -58,64 +63,127 @@ static int send_message(const message_t *msg) {
     return 0;
 }
 
-static int receive_response(const char *fifo_path, response_t *resp) {
-    int fd;
-    ssize_t n;
+/* Parse command string into argv array */
+static char **parse_command(const char *cmd_str, int *argc_out) {
+    char *cmd_copy;
+    char *saveptr;
+    char *token;
+    char **argv;
+    int count = 0;
+    int capacity = 10;
 
-    /* Create the reply FIFO */
-    unlink(fifo_path);
-    if (mkfifo(fifo_path, 0666) < 0) {
-        print_error("Cannot create reply FIFO");
-        return -1;
+    cmd_copy = strdup(cmd_str);
+    if (!cmd_copy) {
+        return NULL;
     }
 
-    /* Open for reading (this will block until the other side opens for writing) */
-    fd = open(fifo_path, O_RDONLY);
-    if (fd < 0) {
-        print_error("Cannot open reply FIFO");
-        unlink(fifo_path);
-        return -1;
+    argv = malloc((capacity + 1) * sizeof(char *));
+    if (!argv) {
+        free(cmd_copy);
+        return NULL;
     }
 
-    n = read(fd, resp, sizeof(*resp));
-    close(fd);
-    unlink(fifo_path);
-
-    if (n != (ssize_t)sizeof(*resp)) {
-        print_error("Failed to receive response from controller");
-        return -1;
+    token = strtok_r(cmd_copy, " ", &saveptr);
+    while (token) {
+        if (count >= capacity) {
+            capacity *= 2;
+            char **new_argv = realloc(argv, (capacity + 1) * sizeof(char *));
+            if (!new_argv) {
+                for (int i = 0; i < count; i++) {
+                    free(argv[i]);
+                }
+                free(argv);
+                free(cmd_copy);
+                return NULL;
+            }
+            argv = new_argv;
+        }
+        argv[count] = strdup(token);
+        if (!argv[count]) {
+            for (int i = 0; i < count; i++) {
+                free(argv[i]);
+            }
+            free(argv);
+            free(cmd_copy);
+            return NULL;
+        }
+        count++;
+        token = strtok_r(NULL, " ", &saveptr);
     }
+    free(cmd_copy);
+    argv[count] = NULL;
+    *argc_out = count;
+    return argv;
+}
 
-    return 0;
+static void free_argv(char **argv) {
+    if (!argv) return;
+    for (int i = 0; argv[i]; i++) {
+        free(argv[i]);
+    }
+    free(argv);
 }
 
 static int cmd_execute(int user_id, const char *command) {
     message_t msg;
     response_t resp;
-    char *fifo_path;
+    char fifo_path[RUNNER_FIFO_PATH_MAX];
     pid_t pid;
+    pid_t cmd_pid;
+    int status;
+    unsigned long cmd_id;
+    int reply_fd;
+    
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);
 
     pid = getpid();
-    fifo_path = generate_fifo_path(pid);
+    cmd_id = g_command_id++;
+    generate_fifo_path(pid, cmd_id, fifo_path, sizeof(fifo_path));
+
+    /* Create the reply FIFO FIRST, before sending message */
+    unlink(fifo_path);
+    if (mkfifo(fifo_path, 0666) < 0) {
+        perror("mkfifo");
+        print_error("Cannot create reply FIFO");
+        return 1;
+    }
 
     /* Create and send the SUBMIT message */
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_SUBMIT;
     msg.user_id = user_id;
-    msg.command_id = g_command_id;
+    msg.command_id = cmd_id;
     msg.runner_pid = pid;
     strncpy(msg.reply_fifo, fifo_path, sizeof(msg.reply_fifo) - 1);
     strncpy(msg.command, command, sizeof(msg.command) - 1);
 
+    printf("Submitting command (ID: %lu, User: %d)\n", cmd_id, user_id);
+    printf("Command: %s\n", command);
+    fflush(stdout);
+
     if (send_message(&msg) < 0) {
+        unlink(fifo_path);
         return 1;
     }
 
-    printf("Submitting command (ID: %lu, User: %d)\n", msg.command_id, user_id);
-    printf("Command: %s\n", command);
+    /* Now open the reply FIFO for reading - this will block until controller opens for writing */
+    reply_fd = open(fifo_path, O_RDONLY);
+    if (reply_fd < 0) {
+        perror("open");
+        print_error("Cannot open reply FIFO");
+        unlink(fifo_path);
+        return 1;
+    }
 
-    /* Wait for response */
-    if (receive_response(fifo_path, &resp) < 0) {
+    /* Read the response */
+    ssize_t n = read(reply_fd, &resp, sizeof(resp));
+    close(reply_fd);
+    unlink(fifo_path);
+
+    if (n != (ssize_t)sizeof(resp)) {
+        print_error("Failed to receive response from controller");
         return 1;
     }
 
@@ -124,17 +192,76 @@ static int cmd_execute(int user_id, const char *command) {
         return 1;
     }
 
-    if (resp.type == MSG_START) {
-        print_info("Command accepted and started by controller");
-        printf("Command ID: %lu\n", msg.command_id);
-        return 0;
-    } else if (resp.type == MSG_ERROR) {
-        fprintf(stderr, "Error from controller: %s\n", resp.info);
+    if (resp.type != MSG_START) {
+        if (resp.type == MSG_ERROR) {
+            fprintf(stderr, "Error from controller: %s\n", resp.info);
+        } else {
+            print_error("Unexpected response type from controller");
+        }
         return 1;
     }
 
-    print_error("Unexpected response type from controller");
-    return 1;
+    print_info("Command accepted and started by controller");
+    printf("Command ID: %lu, PID: %d\n", cmd_id, pid);
+    fflush(stdout);
+
+    /* Execute the command */
+    cmd_pid = fork();
+    if (cmd_pid < 0) {
+        perror("fork");
+        return 1;
+    }
+
+    if (cmd_pid == 0) {
+        /* Child process: execute the command */
+        int argc;
+        char **argv = parse_command(command, &argc);
+        
+        if (!argv || argc == 0) {
+            fprintf(stderr, "ERROR: Failed to parse command: %s\n", command);
+            exit(127);
+        }
+
+        /* Execute the command */
+        execvp(argv[0], argv);
+        
+        /* execvp only returns on error */
+        perror("execvp");
+        fprintf(stderr, "ERROR: Failed to execute: %s\n", command);
+        free_argv(argv);
+        exit(127);
+    } else {
+        /* Parent process: wait for child to complete */
+        if (waitpid(cmd_pid, &status, 0) < 0) {
+            perror("waitpid");
+            return 1;
+        }
+
+        if (WIFEXITED(status)) {
+            int exit_code = WEXITSTATUS(status);
+            if (exit_code != 0) {
+                fprintf(stderr, "Command exited with code %d\n", exit_code);
+            }
+        } else if (WIFSIGNALED(status)) {
+            int sig = WTERMSIG(status);
+            fprintf(stderr, "Command terminated by signal %d\n", sig);
+        }
+
+        /* Send FINISH message to controller */
+        memset(&msg, 0, sizeof(msg));
+        msg.type = MSG_FINISH;
+        msg.user_id = user_id;
+        msg.command_id = cmd_id;
+        msg.runner_pid = pid;
+
+        if (send_message(&msg) < 0) {
+            print_error("Failed to notify controller of command completion");
+            return 1;
+        }
+
+        print_info("Command completed and controller notified");
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+    }
 }
 
 static int cmd_check_status(void) {
@@ -143,9 +270,21 @@ static int cmd_check_status(void) {
     char fifo_path[RUNNER_FIFO_PATH_MAX];
     pid_t pid;
     int i;
+    int reply_fd;
+    ssize_t n;
+    unsigned long cmd_id;
 
     pid = getpid();
-    snprintf(fifo_path, sizeof(fifo_path), "/tmp/so_runner_status_%d.fifo", pid);
+    cmd_id = g_command_id++;
+    generate_fifo_path(pid, cmd_id, fifo_path, sizeof(fifo_path));
+
+    /* Create the reply FIFO first */
+    unlink(fifo_path);
+    if (mkfifo(fifo_path, 0666) < 0) {
+        perror("mkfifo");
+        print_error("Cannot create reply FIFO");
+        return 1;
+    }
 
     /* Create and send the STATUS_REQ message */
     memset(&msg, 0, sizeof(msg));
@@ -154,13 +293,28 @@ static int cmd_check_status(void) {
     strncpy(msg.reply_fifo, fifo_path, sizeof(msg.reply_fifo) - 1);
 
     if (send_message(&msg) < 0) {
+        unlink(fifo_path);
         return 1;
     }
 
     printf("Requesting controller status...\n");
+    fflush(stdout);
 
-    /* Wait for response */
-    if (receive_response(fifo_path, &resp) < 0) {
+    /* Open the reply FIFO for reading */
+    reply_fd = open(fifo_path, O_RDONLY);
+    if (reply_fd < 0) {
+        perror("open");
+        print_error("Cannot open reply FIFO");
+        unlink(fifo_path);
+        return 1;
+    }
+
+    n = read(reply_fd, &resp, sizeof(resp));
+    close(reply_fd);
+    unlink(fifo_path);
+
+    if (n != (ssize_t)sizeof(resp)) {
+        print_error("Failed to receive response from controller");
         return 1;
     }
 
@@ -196,9 +350,21 @@ static int cmd_shutdown(void) {
     response_t resp;
     char fifo_path[RUNNER_FIFO_PATH_MAX];
     pid_t pid;
+    int reply_fd;
+    ssize_t n;
+    unsigned long cmd_id;
 
     pid = getpid();
-    snprintf(fifo_path, sizeof(fifo_path), "/tmp/so_runner_shutdown_%d.fifo", pid);
+    cmd_id = g_command_id++;
+    generate_fifo_path(pid, cmd_id, fifo_path, sizeof(fifo_path));
+
+    /* Create the reply FIFO first */
+    unlink(fifo_path);
+    if (mkfifo(fifo_path, 0666) < 0) {
+        perror("mkfifo");
+        print_error("Cannot create reply FIFO");
+        return 1;
+    }
 
     /* Create and send the SHUTDOWN_REQ message */
     memset(&msg, 0, sizeof(msg));
@@ -207,13 +373,28 @@ static int cmd_shutdown(void) {
     strncpy(msg.reply_fifo, fifo_path, sizeof(msg.reply_fifo) - 1);
 
     if (send_message(&msg) < 0) {
+        unlink(fifo_path);
         return 1;
     }
 
     printf("Requesting controller shutdown...\n");
+    fflush(stdout);
 
-    /* Wait for response */
-    if (receive_response(fifo_path, &resp) < 0) {
+    /* Open the reply FIFO for reading */
+    reply_fd = open(fifo_path, O_RDONLY);
+    if (reply_fd < 0) {
+        perror("open");
+        print_error("Cannot open reply FIFO");
+        unlink(fifo_path);
+        return 1;
+    }
+
+    n = read(reply_fd, &resp, sizeof(resp));
+    close(reply_fd);
+    unlink(fifo_path);
+
+    if (n != (ssize_t)sizeof(resp)) {
+        print_error("Failed to receive response from controller");
         return 1;
     }
 

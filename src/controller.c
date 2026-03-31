@@ -92,7 +92,7 @@ static int write_full(int fd, const void *buf, size_t len) {
 static int send_response(const char *fifo_path, const response_t *resp) {
     int fd;
 
-    fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
+    fd = open(fifo_path, O_WRONLY);
     if (fd < 0) {
         return -1;
     }
@@ -337,6 +337,7 @@ static void schedule_jobs(controller_state_t *state) {
         memset(&resp, 0, sizeof(resp));
         resp.type = MSG_START;
         resp.ok = 1;
+        
         if (send_response(job->reply_fifo, &resp) != 0) {
             /* If the runner is gone, free the slot to keep controller healthy. */
             (void)finish_executing(state, job->user_id, job->command_id);

@@ -14,6 +14,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define HISTORY_MAX_ENTRIES 256
+#define DEFAULT_ESTIMATE_MS 1000LL
+
 typedef struct job {
     int user_id;
     unsigned long command_id;
@@ -24,6 +27,14 @@ typedef struct job {
     struct timeval start_ts;
     struct job *next;
 } job_t;
+
+typedef struct history_entry {
+    int used;
+    int user_id;
+    char command[COMMAND_TEXT_MAX];
+    long long avg_ms;
+    unsigned long runs;
+} history_entry_t;
 
 typedef struct controller_state {
     int max_parallel;
@@ -37,6 +48,7 @@ typedef struct controller_state {
     job_t *scheduled_head;
     job_t *scheduled_tail;
     job_t *executing_head;
+    history_entry_t history[HISTORY_MAX_ENTRIES];
 } controller_state_t;
 
 static volatile sig_atomic_t g_stop_signal = 0;
@@ -57,12 +69,13 @@ static void usage(void) {
     safe_write_text(
         STDERR_FILENO,
         "usage: ./controller <parallel-commands> <sched-policy>\n"
-        "  sched-policy: FCFS | RR_USER\n");
+        "  sched-policy: FCFS | RR_USER | SJF_PROXY\n");
 }
 
 static int is_valid_policy(const char *policy) {
     return strcmp(policy, "FCFS") == 0 || strcmp(policy, "RR_USER") == 0 ||
-           strcmp(policy, "RR-U") == 0;
+           strcmp(policy, "RR-U") == 0 || strcmp(policy, "SJF_PROXY") == 0 ||
+           strcmp(policy, "SJF") == 0;
 }
 
 static int write_full(int fd, const void *buf, size_t len) {
@@ -161,6 +174,97 @@ static int is_rr_user_policy(const controller_state_t *state) {
            strcmp(state->policy, "RR-U") == 0;
 }
 
+static int is_sjf_proxy_policy(const controller_state_t *state) {
+    return strcmp(state->policy, "SJF_PROXY") == 0 || strcmp(state->policy, "SJF") == 0;
+}
+
+static history_entry_t *find_history_entry(controller_state_t *state,
+                                           int user_id,
+                                           const char *command,
+                                           int create_if_missing) {
+    int i;
+    int free_index;
+
+    free_index = -1;
+    for (i = 0; i < HISTORY_MAX_ENTRIES; i++) {
+        if (state->history[i].used) {
+            if (state->history[i].user_id == user_id &&
+                strcmp(state->history[i].command, command) == 0) {
+                return &state->history[i];
+            }
+        } else if (free_index < 0) {
+            free_index = i;
+        }
+    }
+
+    if (!create_if_missing || free_index < 0) {
+        return NULL;
+    }
+
+    state->history[free_index].used = 1;
+    state->history[free_index].user_id = user_id;
+    state->history[free_index].avg_ms = 0;
+    state->history[free_index].runs = 0;
+    strncpy(state->history[free_index].command,
+            command,
+            sizeof(state->history[free_index].command) - 1);
+    return &state->history[free_index];
+}
+
+static long long parse_sleep_hint_ms(const char *command) {
+    const char *prefix;
+    char *endptr;
+    double seconds;
+
+    prefix = "sleep ";
+    if (strncmp(command, prefix, strlen(prefix)) != 0) {
+        return -1;
+    }
+
+    seconds = strtod(command + strlen(prefix), &endptr);
+    if (endptr == command + strlen(prefix) || seconds < 0.0) {
+        return -1;
+    }
+
+    return (long long)(seconds * 1000.0);
+}
+
+static long long estimate_job_ms(controller_state_t *state, const job_t *job) {
+    history_entry_t *entry;
+    long long hint;
+
+    entry = find_history_entry(state, job->user_id, job->command, 0);
+    if (entry != NULL && entry->runs > 0) {
+        return entry->avg_ms;
+    }
+
+    hint = parse_sleep_hint_ms(job->command);
+    if (hint >= 0) {
+        return hint;
+    }
+
+    return DEFAULT_ESTIMATE_MS;
+}
+
+static void update_history(controller_state_t *state, const job_t *job, long long total_ms) {
+    history_entry_t *entry;
+
+    entry = find_history_entry(state, job->user_id, job->command, 1);
+    if (entry == NULL) {
+        return;
+    }
+
+    if (entry->runs == 0) {
+        entry->avg_ms = total_ms;
+        entry->runs = 1;
+        return;
+    }
+
+    entry->avg_ms = (entry->avg_ms * (long long)entry->runs + total_ms) /
+                    (long long)(entry->runs + 1);
+    entry->runs++;
+}
+
 static job_t *dequeue_scheduled_rr_user(controller_state_t *state) {
     job_t *prev;
     job_t *cur;
@@ -200,7 +304,53 @@ static job_t *dequeue_scheduled_rr_user(controller_state_t *state) {
     return pick;
 }
 
+static job_t *dequeue_scheduled_sjf_proxy(controller_state_t *state) {
+    job_t *prev;
+    job_t *cur;
+    job_t *pick_prev;
+    job_t *pick;
+    long long best_estimate;
+
+    prev = NULL;
+    cur = state->scheduled_head;
+    pick_prev = NULL;
+    pick = NULL;
+    best_estimate = 0;
+
+    while (cur != NULL) {
+        long long est;
+        est = estimate_job_ms(state, cur);
+        if (pick == NULL || est < best_estimate) {
+            pick_prev = prev;
+            pick = cur;
+            best_estimate = est;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (pick == NULL) {
+        return NULL;
+    }
+
+    if (pick_prev == NULL) {
+        state->scheduled_head = pick->next;
+    } else {
+        pick_prev->next = pick->next;
+    }
+
+    if (pick == state->scheduled_tail) {
+        state->scheduled_tail = pick_prev;
+    }
+
+    pick->next = NULL;
+    return pick;
+}
+
 static job_t *dequeue_next_scheduled(controller_state_t *state) {
+    if (is_sjf_proxy_policy(state)) {
+        return dequeue_scheduled_sjf_proxy(state);
+    }
     if (is_rr_user_policy(state)) {
         return dequeue_scheduled_rr_user(state);
     }
@@ -223,6 +373,50 @@ static long long elapsed_ms(const struct timeval *start, const struct timeval *e
 
 static long long epoch_ms(const struct timeval *ts) {
     return (long long)ts->tv_sec * 1000LL + (long long)ts->tv_usec / 1000LL;
+}
+
+static void log_event(const char *event_type,
+                      int user_id,
+                      unsigned long command_id,
+                      const char *extra_info) {
+    int fd;
+    struct timeval now;
+    long long ts_ms;
+    char line[768];
+    int len;
+
+    gettimeofday(&now, NULL);
+    ts_ms = epoch_ms(&now);
+
+    fd = open("tmp/events.log", O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) {
+        return;
+    }
+
+    if (extra_info != NULL) {
+        len = snprintf(line,
+                       sizeof(line),
+                       "%lld,%s,%d,%lu,%s\n",
+                       ts_ms,
+                       event_type,
+                       user_id,
+                       command_id,
+                       extra_info);
+    } else {
+        len = snprintf(line,
+                       sizeof(line),
+                       "%lld,%s,%d,%lu\n",
+                       ts_ms,
+                       event_type,
+                       user_id,
+                       command_id);
+    }
+
+    if (len > 0) {
+        (void)write(fd, line, (size_t)len);
+    }
+
+    close(fd);
 }
 
 static void log_finished_job(const job_t *job) {
@@ -282,6 +476,19 @@ static int finish_executing(controller_state_t *state, int user_id, unsigned lon
             if (state->current_running > 0) {
                 state->current_running--;
             }
+
+            {
+                struct timeval end_ts;
+                long long total_ms;
+                char extra[64];
+
+                gettimeofday(&end_ts, NULL);
+                total_ms = elapsed_ms(&cur->submit_ts, &end_ts);
+                update_history(state, cur, total_ms);
+                snprintf(extra, sizeof(extra), "total_ms=%lld", total_ms);
+                log_event("FINISH", cur->user_id, cur->command_id, extra);
+            }
+
             log_finished_job(cur);
             free(cur);
             return 0;
@@ -338,6 +545,8 @@ static void schedule_jobs(controller_state_t *state) {
         state->has_last_user = 1;
         state->last_user_id = job->user_id;
 
+        log_event("START", job->user_id, job->command_id, job->command);
+
         memset(&resp, 0, sizeof(resp));
         resp.type = MSG_START;
         resp.ok = 1;
@@ -374,7 +583,8 @@ int main(int argc, char **argv) {
     }
     strncpy(state.policy, argv[2], sizeof(state.policy) - 1);
     if (!is_valid_policy(state.policy)) {
-        safe_write_text(STDERR_FILENO, "invalid sched-policy. use FCFS or RR_USER\n");
+        safe_write_text(STDERR_FILENO,
+                        "invalid sched-policy. use FCFS, RR_USER or SJF_PROXY\n");
         return 1;
     }
 
@@ -488,6 +698,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
 
+                log_event("SUBMIT", msg.user_id, msg.command_id, msg.command);
                 enqueue_scheduled(&state, job);
             } else if (msg.type == MSG_FINISH) {
                 (void)finish_executing(&state, msg.user_id, msg.command_id);

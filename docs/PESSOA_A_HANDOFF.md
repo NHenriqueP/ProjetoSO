@@ -4,12 +4,13 @@
 
 Controller funcional com:
 - FIFO publico do controller (`/tmp/so_controller_fifo`)
-- Escalonamento com duas politicas: `FCFS` e `RR_USER`
+- Escalonamento com tres politicas: `FCFS`, `RR_USER` e `SJF_PROXY`
 - Limite de paralelismo (`parallel-commands`)
 - Pedido de estado (`MSG_STATUS_REQ`)
 - Shutdown gracioso (`MSG_SHUTDOWN_REQ`) com ACK apenas no encerramento real
 - Registo persistente de execucoes em `tmp/executions.log`
-- Validacao de politica no arranque (aceita apenas `FCFS` e `RR_USER`)
+- Registo de eventos em `tmp/events.log` com transicoes (`SUBMIT`, `START`, `FINISH`)
+- Validacao de politica no arranque (aceita `FCFS`, `RR_USER` e `SJF_PROXY`)
 - Tratamento defensivo de `SIGPIPE` no envio de respostas
 
 ## Protocolo IPC
@@ -57,14 +58,17 @@ Noutro terminal:
 ## Experimentos automáticos
 
 Script principal:
-`./scripts/run_policy_experiment.sh <FCFS|RR_USER> [parallel-commands]`
+`./scripts/run_policy_experiment.sh <FCFS|RR_USER|SJF_PROXY> [parallel-commands] [repetitions]`
 
 Exemplos:
-`./scripts/run_policy_experiment.sh FCFS 1`
-`./scripts/run_policy_experiment.sh RR_USER 1`
+`./scripts/run_policy_experiment.sh FCFS 1 3`
+`./scripts/run_policy_experiment.sh RR_USER 1 3`
+`./scripts/run_policy_experiment.sh SJF_PROXY 1 3`
 
-Resumo de metricas (espera e turnaround) e gap de justica:
-`awk -f scripts/summarize_executions.awk tmp/executions.log`
+Resumo final de metricas (espera, turnaround e gap de justica):
+- saida principal no terminal
+- detalhes por repeticao em `tmp/experiment_runs.csv`
+- tabela final em `tmp/final_metrics_table.txt`
 
 Nota: `fairness_wait_gap_ms` mais baixo tende a indicar melhor justica entre utilizadores.
 
@@ -84,9 +88,9 @@ Requisitos para a Pessoa B:
 - Se nao existir utilizador diferente na fila, faz fallback para cabeca da fila.
 - Durante shutdown, novos `MSG_SUBMIT` recebem `MSG_ERROR`.
 
-## To-do da Pessoa A antes da integracao da Pessoa B
+## Estado dos itens finais
 
-- Adicionar mais uma politica (ex.: `SJF_PROXY`, com base em historico por utilizador/comando).
-- Escrever `tmp/events.log` com transicoes (`SUBMIT`, `START`, `FINISH`) para facilitar debug.
-- Acrescentar script com 3-5 repeticoes por politica para reduzir ruido de medicao.
-- Criar uma tabela final para o relatorio com `avg_wait_ms`, `avg_total_ms`, `fairness_wait_gap_ms`.
+- Politica adicional `SJF_PROXY`: concluido.
+- `tmp/events.log` com transicoes (`SUBMIT`, `START`, `FINISH`): concluido.
+- Script com repeticoes por politica: concluido.
+- Tabela final para relatorio (`avg_wait_ms`, `avg_total_ms`, `fairness_wait_gap_ms`): concluido em `tmp/final_metrics_table.txt`.

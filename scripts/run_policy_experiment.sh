@@ -36,7 +36,6 @@ cleanup() {
 trap cleanup EXIT
 
 make >/dev/null
-make fake_runner >/dev/null
 
 summary_csv="tmp/experiment_runs.csv"
 table_file="tmp/final_metrics_table.txt"
@@ -52,18 +51,18 @@ run_once() {
   sleep 0.2
 
   # Mixed workload with repeated user IDs to stress fairness.
-  ./bin/fake_runner submit 1 7001 2 >/tmp/fr_7001.log 2>&1 & p1=$!
+  ./bin/runner -e 1 "sleep 2" >/tmp/fr_7001.log 2>&1 & p1=$!
   sleep 0.05
-  ./bin/fake_runner submit 1 7002 0 >/tmp/fr_7002.log 2>&1 & p2=$!
+  ./bin/runner -e 1 "true" >/tmp/fr_7002.log 2>&1 & p2=$!
   sleep 0.05
-  ./bin/fake_runner submit 2 7003 1 >/tmp/fr_7003.log 2>&1 & p3=$!
+  ./bin/runner -e 2 "sleep 1" >/tmp/fr_7003.log 2>&1 & p3=$!
   sleep 0.05
-  ./bin/fake_runner submit 3 7004 0 >/tmp/fr_7004.log 2>&1 & p4=$!
+  ./bin/runner -e 3 "true" >/tmp/fr_7004.log 2>&1 & p4=$!
   sleep 0.05
-  ./bin/fake_runner submit 2 7005 0 >/tmp/fr_7005.log 2>&1 & p5=$!
+  ./bin/runner -e 2 "true" >/tmp/fr_7005.log 2>&1 & p5=$!
 
   wait "$p1" "$p2" "$p3" "$p4" "$p5"
-  ./bin/fake_runner shutdown >/tmp/fr_shutdown.log 2>&1
+  ./bin/runner -s >/tmp/fr_shutdown.log 2>&1
   wait "$controller_pid"
   controller_pid=""
 }

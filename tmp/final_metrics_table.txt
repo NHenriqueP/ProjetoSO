@@ -1,6 +1,0 @@
-policy=SJF_PROXY
-parallel=1
-repetitions=2
-avg_wait_ms=2095.700
-avg_total_ms=2696.000
-fairness_wait_gap_ms=1368.500

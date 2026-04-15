@@ -41,19 +41,19 @@ Onde:
 - `wait_ms = start - submit`
 - `total_ms = end - submit`
 
-## Teste rapido (sem runner final)
+## Teste rapido
 
 Compilar:
-`make && make fake_runner`
+`make`
 
-Executar controller:
+Executar controller (exemplo com paralelismo 1 e politica FCFS):
 `./bin/controller 1 FCFS`
 
-Noutro terminal:
-`./bin/fake_runner submit 1 1001 2`
-`./bin/fake_runner submit 2 1002 0`
-`./bin/fake_runner status`
-`./bin/fake_runner shutdown`
+Noutro terminal, executar comandos reais através do runner:
+`./bin/runner -e 1 "sleep 2"`
+`./bin/runner -e 2 "sleep 1"`
+`./bin/runner -c`
+`./bin/runner -s`
 
 ## Experimentos automáticos
 

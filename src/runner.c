@@ -33,10 +33,6 @@ static void print_error(const char *msg) {
     fprintf(stderr, "ERROR: %s\n", msg);
 }
 
-static void print_info(const char *msg) {
-    fprintf(stdout, "INFO: %s\n", msg);
-}
-
 static void generate_fifo_path(pid_t pid, unsigned long cmd_id, char *buffer, size_t bufsize) {
     snprintf(buffer, bufsize, "/tmp/so_runner_%d_%lu.fifo", pid, cmd_id);
 }
@@ -115,6 +111,108 @@ static int send_message(const message_t *msg) {
     return 0;
 }
 
+#define MAX_CMDS 20
+#define MAX_ARGS 50
+
+static void execute_pipeline(char *cmdline) {
+    char *cmds[MAX_CMDS];
+    int num_cmds = 0;
+    
+    char *saveptr_pipe;
+    char *token = strtok_r(cmdline, "|", &saveptr_pipe);
+    while (token && num_cmds < MAX_CMDS) {
+        cmds[num_cmds++] = token;
+        token = strtok_r(NULL, "|", &saveptr_pipe);
+    }
+    
+    if (num_cmds == 0) exit(0);
+    
+    int pipes[MAX_CMDS - 1][2];
+    for (int i = 0; i < num_cmds - 1; i++) {
+        if (pipe(pipes[i]) < 0) {
+            perror("pipe");
+            exit(1);
+        }
+    }
+    
+    pid_t pids[MAX_CMDS];
+    for (int i = 0; i < num_cmds; i++) {
+        pids[i] = fork();
+        if (pids[i] < 0) {
+            perror("fork");
+            exit(1);
+        }
+        
+        if (pids[i] == 0) {
+            if (i > 0) dup2(pipes[i-1][0], STDIN_FILENO);
+            if (i < num_cmds - 1) dup2(pipes[i][1], STDOUT_FILENO);
+            
+            for (int j = 0; j < num_cmds - 1; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            
+            char *args[MAX_ARGS];
+            int argc = 0;
+            char *in_file = NULL, *out_file = NULL, *err_file = NULL;
+            
+            char *saveptr_space;
+            char *word = strtok_r(cmds[i], " \t\n", &saveptr_space);
+            while (word && argc < MAX_ARGS - 1) {
+                if (strcmp(word, "<") == 0) {
+                    in_file = strtok_r(NULL, " \t\n", &saveptr_space);
+                } else if (strcmp(word, ">") == 0) {
+                    out_file = strtok_r(NULL, " \t\n", &saveptr_space);
+                } else if (strcmp(word, "2>") == 0) {
+                    err_file = strtok_r(NULL, " \t\n", &saveptr_space);
+                } else if (strncmp(word, "2>", 2) == 0) {
+                    err_file = word + 2;
+                } else if (word[0] == '>') {
+                    out_file = word + 1;
+                } else if (word[0] == '<') {
+                    in_file = word + 1;
+                } else {
+                    args[argc++] = word;
+                }
+                word = strtok_r(NULL, " \t\n", &saveptr_space);
+            }
+            args[argc] = NULL;
+            if (argc == 0) exit(0);
+            
+            if (in_file) {
+                int fd = open(in_file, O_RDONLY);
+                if (fd >= 0) { dup2(fd, STDIN_FILENO); close(fd); }
+                else { perror("open in"); exit(1); }
+            }
+            if (out_file) {
+                int fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
+                else { perror("open out"); exit(1); }
+            }
+            if (err_file) {
+                int fd = open(err_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); }
+                else { perror("open err"); exit(1); }
+            }
+            
+            execvp(args[0], args);
+            perror(args[0]);
+            exit(127);
+        }
+    }
+    
+    for (int j = 0; j < num_cmds - 1; j++) {
+        close(pipes[j][0]);
+        close(pipes[j][1]);
+    }
+    
+    int status = 0;
+    for (int i = 0; i < num_cmds; i++) {
+        waitpid(pids[i], &status, 0);
+    }
+    exit(WIFEXITED(status) ? WEXITSTATUS(status) : 127);
+}
+
 static int cmd_execute(int user_id, const char *command) {
     message_t msg;
     response_t resp;
@@ -162,8 +260,7 @@ static int cmd_execute(int user_id, const char *command) {
     strncpy(msg.reply_fifo, fifo_path, sizeof(msg.reply_fifo) - 1);
     strncpy(msg.command, command, sizeof(msg.command) - 1);
 
-    printf("Submitting command (ID: %lu, User: %d)\n", cmd_id, user_id);
-    printf("Command: %s\n", command);
+    printf("[runner] command %lu submitted\n", cmd_id);
     fflush(stdout);
 
     if (send_message(&msg) < 0) {
@@ -197,8 +294,7 @@ static int cmd_execute(int user_id, const char *command) {
         return 1;
     }
 
-    print_info("Command accepted and started by controller");
-    printf("Command ID: %lu, PID: %d\n", cmd_id, pid);
+    printf("[runner] executing command %lu...\n", cmd_id);
     fflush(stdout);
 
     /* Execute the command */
@@ -209,26 +305,17 @@ static int cmd_execute(int user_id, const char *command) {
     }
 
     if (cmd_pid == 0) {
-        /* Child process: execute the command via shell to preserve quoting/pipes/redirections. */
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
-        perror("execl");
-        fprintf(stderr, "ERROR: Failed to execute: %s\n", command);
-        exit(127);
+        /* Child process: execute the command via custom pipeline executor */
+        char cmd_copy[COMMAND_TEXT_MAX];
+        strncpy(cmd_copy, command, sizeof(cmd_copy));
+        cmd_copy[sizeof(cmd_copy)-1] = '\0';
+        execute_pipeline(cmd_copy);
+        exit(127); /* execute_pipeline shouldn't return */
     } else {
         /* Parent process: wait for child to complete */
         if (waitpid(cmd_pid, &status, 0) < 0) {
             perror("waitpid");
             return 1;
-        }
-
-        if (WIFEXITED(status)) {
-            int exit_code = WEXITSTATUS(status);
-            if (exit_code != 0) {
-                fprintf(stderr, "Command exited with code %d\n", exit_code);
-            }
-        } else if (WIFSIGNALED(status)) {
-            int sig = WTERMSIG(status);
-            fprintf(stderr, "Command terminated by signal %d\n", sig);
         }
 
         /* Send FINISH message to controller */
@@ -243,7 +330,9 @@ static int cmd_execute(int user_id, const char *command) {
             return 1;
         }
 
-        print_info("Command completed and controller notified");
+        printf("[runner] command %lu finished\n", cmd_id);
+        fflush(stdout);
+        
         return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
     }
 }
@@ -308,23 +397,19 @@ static int cmd_check_status(void) {
     }
 
     /* Display status */
-    printf("\n=== Controller Status ===\n");
-    printf("Executing: %d job(s)\n", resp.executing_count);
+    printf("--Executing\n");
     for (i = 0; i < resp.executing_count; i++) {
-        printf("  [%d] User %d, Command %lu\n", 
-               i + 1, 
+        printf("user-id %d - command-id %lu\n", 
                resp.executing[i].user_id, 
                resp.executing[i].command_id);
     }
 
-    printf("Scheduled: %d job(s)\n", resp.scheduled_count);
+    printf("--Scheduled\n");
     for (i = 0; i < resp.scheduled_count; i++) {
-        printf("  [%d] User %d, Command %lu\n", 
-               i + 1, 
+        printf("user-id %d - command-id %lu\n", 
                resp.scheduled[i].user_id, 
                resp.scheduled[i].command_id);
     }
-    printf("========================\n");
 
     return 0;
 }
@@ -369,7 +454,8 @@ static int cmd_shutdown(void) {
         return 1;
     }
 
-    printf("Requesting controller shutdown...\n");
+    printf("[runner] sent shutdown notification\n");
+    printf("[runner] waiting for controller to shutdown...\n");
     fflush(stdout);
 
     if (read_full(reply_fd, &resp, sizeof(resp)) != 0) {
@@ -388,8 +474,7 @@ static int cmd_shutdown(void) {
     }
 
     if (resp.type == MSG_SHUTDOWN_ACK) {
-        print_info("Controller acknowledged shutdown request");
-        printf("The controller is shutting down.\n");
+        printf("[runner] controller exited.\n");
         return 0;
     }
 

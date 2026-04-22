@@ -2,6 +2,7 @@
 
 #include "protocol.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -113,104 +114,389 @@ static int send_message(const message_t *msg) {
 
 #define MAX_CMDS 20
 #define MAX_ARGS 50
+#define MAX_TOKENS 256
 
-static void execute_pipeline(char *cmdline) {
-    char *cmds[MAX_CMDS];
-    int num_cmds = 0;
-    
-    char *saveptr_pipe;
-    char *token = strtok_r(cmdline, "|", &saveptr_pipe);
-    while (token && num_cmds < MAX_CMDS) {
-        cmds[num_cmds++] = token;
-        token = strtok_r(NULL, "|", &saveptr_pipe);
+typedef struct parsed_command {
+    char *argv[MAX_ARGS];
+    int argc;
+    char *in_file;
+    char *out_file;
+    char *err_file;
+} parsed_command_t;
+
+static void free_tokens(char *tokens[], int token_count) {
+    int i;
+
+    for (i = 0; i < token_count; i++) {
+        free(tokens[i]);
     }
-    
-    if (num_cmds == 0) exit(0);
-    
-    int pipes[MAX_CMDS - 1][2];
-    for (int i = 0; i < num_cmds - 1; i++) {
-        if (pipe(pipes[i]) < 0) {
-            perror("pipe");
-            exit(1);
-        }
+}
+
+static int push_token(char *tokens[], int *token_count, const char *token) {
+    char *copy;
+
+    if (*token_count >= MAX_TOKENS) {
+        return -1;
     }
-    
-    pid_t pids[MAX_CMDS];
-    for (int i = 0; i < num_cmds; i++) {
-        pids[i] = fork();
-        if (pids[i] < 0) {
-            perror("fork");
-            exit(1);
+
+    copy = strdup(token);
+    if (copy == NULL) {
+        return -1;
+    }
+
+    tokens[*token_count] = copy;
+    (*token_count)++;
+    return 0;
+}
+
+static int is_operator_token(const char *token) {
+    return strcmp(token, "|") == 0 || strcmp(token, "<") == 0 ||
+           strcmp(token, ">") == 0 || strcmp(token, "2>") == 0;
+}
+
+static int is_operator_start(const char *cmdline, size_t index) {
+    return cmdline[index] == '|' || cmdline[index] == '<' ||
+           cmdline[index] == '>' ||
+           (cmdline[index] == '2' && cmdline[index + 1] == '>');
+}
+
+static int append_char(char *buf, size_t *len, char c, size_t max_len) {
+    if (*len + 1 >= max_len) {
+        return -1;
+    }
+    buf[*len] = c;
+    (*len)++;
+    return 0;
+}
+
+static int tokenize_command(const char *cmdline, char *tokens[], int *token_count) {
+    size_t i;
+
+    *token_count = 0;
+    i = 0;
+    while (cmdline[i] != '\0') {
+        char token_buf[COMMAND_TEXT_MAX];
+        size_t len;
+
+        while (isspace((unsigned char)cmdline[i])) {
+            i++;
         }
-        
-        if (pids[i] == 0) {
-            if (i > 0) dup2(pipes[i-1][0], STDIN_FILENO);
-            if (i < num_cmds - 1) dup2(pipes[i][1], STDOUT_FILENO);
-            
-            for (int j = 0; j < num_cmds - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
+
+        if (cmdline[i] == '\0') {
+            break;
+        }
+
+        if (cmdline[i] == '|') {
+            if (push_token(tokens, token_count, "|") != 0) {
+                free_tokens(tokens, *token_count);
+                return -1;
             }
-            
-            char *args[MAX_ARGS];
-            int argc = 0;
-            char *in_file = NULL, *out_file = NULL, *err_file = NULL;
-            
-            char *saveptr_space;
-            char *word = strtok_r(cmds[i], " \t\n", &saveptr_space);
-            while (word && argc < MAX_ARGS - 1) {
-                if (strcmp(word, "<") == 0) {
-                    in_file = strtok_r(NULL, " \t\n", &saveptr_space);
-                } else if (strcmp(word, ">") == 0) {
-                    out_file = strtok_r(NULL, " \t\n", &saveptr_space);
-                } else if (strcmp(word, "2>") == 0) {
-                    err_file = strtok_r(NULL, " \t\n", &saveptr_space);
-                } else if (strncmp(word, "2>", 2) == 0) {
-                    err_file = word + 2;
-                } else if (word[0] == '>') {
-                    out_file = word + 1;
-                } else if (word[0] == '<') {
-                    in_file = word + 1;
-                } else {
-                    args[argc++] = word;
+            i++;
+            continue;
+        }
+        if (cmdline[i] == '<') {
+            if (push_token(tokens, token_count, "<") != 0) {
+                free_tokens(tokens, *token_count);
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (cmdline[i] == '>') {
+            if (push_token(tokens, token_count, ">") != 0) {
+                free_tokens(tokens, *token_count);
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (cmdline[i] == '2' && cmdline[i + 1] == '>') {
+            if (push_token(tokens, token_count, "2>") != 0) {
+                free_tokens(tokens, *token_count);
+                return -1;
+            }
+            i += 2;
+            continue;
+        }
+
+        len = 0;
+        while (cmdline[i] != '\0' && !isspace((unsigned char)cmdline[i]) &&
+               !is_operator_start(cmdline, i)) {
+            if (cmdline[i] == '\\') {
+                if (cmdline[i + 1] == '\0' ||
+                    append_char(token_buf,
+                                &len,
+                                cmdline[i + 1],
+                                sizeof(token_buf)) != 0) {
+                    free_tokens(tokens, *token_count);
+                    return -1;
                 }
-                word = strtok_r(NULL, " \t\n", &saveptr_space);
+                i += 2;
+                continue;
             }
-            args[argc] = NULL;
-            if (argc == 0) exit(0);
-            
-            if (in_file) {
-                int fd = open(in_file, O_RDONLY);
-                if (fd >= 0) { dup2(fd, STDIN_FILENO); close(fd); }
-                else { perror("open in"); exit(1); }
+
+            if (cmdline[i] == '\'') {
+                i++;
+                while (cmdline[i] != '\0' && cmdline[i] != '\'') {
+                    if (append_char(token_buf,
+                                    &len,
+                                    cmdline[i],
+                                    sizeof(token_buf)) != 0) {
+                        free_tokens(tokens, *token_count);
+                        return -1;
+                    }
+                    i++;
+                }
+                if (cmdline[i] != '\'') {
+                    free_tokens(tokens, *token_count);
+                    return -1;
+                }
+                i++;
+                continue;
             }
-            if (out_file) {
-                int fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
-                else { perror("open out"); exit(1); }
+
+            if (cmdline[i] == '"') {
+                i++;
+                while (cmdline[i] != '\0' && cmdline[i] != '"') {
+                    if (cmdline[i] == '\\' && cmdline[i + 1] != '\0') {
+                        if (append_char(token_buf,
+                                        &len,
+                                        cmdline[i + 1],
+                                        sizeof(token_buf)) != 0) {
+                            free_tokens(tokens, *token_count);
+                            return -1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+
+                    if (append_char(token_buf,
+                                    &len,
+                                    cmdline[i],
+                                    sizeof(token_buf)) != 0) {
+                        free_tokens(tokens, *token_count);
+                        return -1;
+                    }
+                    i++;
+                }
+                if (cmdline[i] != '"') {
+                    free_tokens(tokens, *token_count);
+                    return -1;
+                }
+                i++;
+                continue;
             }
-            if (err_file) {
-                int fd = open(err_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); }
-                else { perror("open err"); exit(1); }
+
+            if (append_char(token_buf, &len, cmdline[i], sizeof(token_buf)) != 0) {
+                free_tokens(tokens, *token_count);
+                return -1;
             }
-            
-            execvp(args[0], args);
-            perror(args[0]);
-            exit(127);
+            i++;
+        }
+
+        token_buf[len] = '\0';
+        if (push_token(tokens, token_count, token_buf) != 0) {
+            free_tokens(tokens, *token_count);
+            return -1;
         }
     }
-    
-    for (int j = 0; j < num_cmds - 1; j++) {
-        close(pipes[j][0]);
-        close(pipes[j][1]);
+
+    return 0;
+}
+
+static int parse_pipeline(char *tokens[],
+                          int token_count,
+                          parsed_command_t commands[],
+                          int *command_count) {
+    int i;
+    int current;
+
+    memset(commands, 0, sizeof(parsed_command_t) * MAX_CMDS);
+    current = 0;
+
+    for (i = 0; i < token_count; i++) {
+        char *tok;
+
+        tok = tokens[i];
+        if (strcmp(tok, "|") == 0) {
+            if (commands[current].argc == 0) {
+                return -1;
+            }
+            commands[current].argv[commands[current].argc] = NULL;
+            current++;
+            if (current >= MAX_CMDS) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (strcmp(tok, "<") == 0 || strcmp(tok, ">") == 0 ||
+            strcmp(tok, "2>") == 0) {
+            char *target;
+
+            if (i + 1 >= token_count || is_operator_token(tokens[i + 1])) {
+                return -1;
+            }
+            target = tokens[++i];
+            if (strcmp(tok, "<") == 0) {
+                commands[current].in_file = target;
+            } else if (strcmp(tok, ">") == 0) {
+                commands[current].out_file = target;
+            } else {
+                commands[current].err_file = target;
+            }
+            continue;
+        }
+
+        if (commands[current].argc >= MAX_ARGS - 1) {
+            return -1;
+        }
+
+        commands[current].argv[commands[current].argc] = tok;
+        commands[current].argc++;
     }
-    
-    int status = 0;
-    for (int i = 0; i < num_cmds; i++) {
-        waitpid(pids[i], &status, 0);
+
+    if (commands[current].argc == 0) {
+        return -1;
     }
-    exit(WIFEXITED(status) ? WEXITSTATUS(status) : 127);
+
+    commands[current].argv[commands[current].argc] = NULL;
+    *command_count = current + 1;
+    return 0;
+}
+
+static int execute_pipeline(const char *cmdline) {
+    parsed_command_t commands[MAX_CMDS];
+    char *tokens[MAX_TOKENS];
+    int pipe_fds[MAX_CMDS - 1][2];
+    pid_t child_pids[MAX_CMDS];
+    int token_count;
+    int command_count;
+    int i;
+    int last_status;
+
+    memset(tokens, 0, sizeof(tokens));
+    last_status = -1;
+
+    if (tokenize_command(cmdline, tokens, &token_count) != 0 || token_count == 0) {
+        print_error("Invalid command syntax");
+        return 127;
+    }
+
+    if (parse_pipeline(tokens, token_count, commands, &command_count) != 0) {
+        free_tokens(tokens, token_count);
+        print_error("Invalid command syntax");
+        return 127;
+    }
+
+    for (i = 0; i < command_count - 1; i++) {
+        if (pipe(pipe_fds[i]) < 0) {
+            free_tokens(tokens, token_count);
+            print_error("Failed to create pipe");
+            return 127;
+        }
+    }
+
+    for (i = 0; i < command_count; i++) {
+        child_pids[i] = fork();
+        if (child_pids[i] < 0) {
+            int j;
+
+            for (j = 0; j < command_count - 1; j++) {
+                close(pipe_fds[j][0]);
+                close(pipe_fds[j][1]);
+            }
+            free_tokens(tokens, token_count);
+            print_error("Failed to fork process");
+            return 127;
+        }
+
+        if (child_pids[i] == 0) {
+            int j;
+
+            if (i > 0 && dup2(pipe_fds[i - 1][0], STDIN_FILENO) < 0) {
+                _exit(127);
+            }
+            if (i < command_count - 1 && dup2(pipe_fds[i][1], STDOUT_FILENO) < 0) {
+                _exit(127);
+            }
+
+            for (j = 0; j < command_count - 1; j++) {
+                close(pipe_fds[j][0]);
+                close(pipe_fds[j][1]);
+            }
+
+            if (commands[i].in_file != NULL) {
+                int fd;
+                fd = open(commands[i].in_file, O_RDONLY);
+                if (fd < 0 || dup2(fd, STDIN_FILENO) < 0) {
+                    if (fd >= 0) {
+                        close(fd);
+                    }
+                    _exit(127);
+                }
+                close(fd);
+            }
+
+            if (commands[i].out_file != NULL) {
+                int fd;
+                fd = open(commands[i].out_file,
+                          O_WRONLY | O_CREAT | O_TRUNC,
+                          0644);
+                if (fd < 0 || dup2(fd, STDOUT_FILENO) < 0) {
+                    if (fd >= 0) {
+                        close(fd);
+                    }
+                    _exit(127);
+                }
+                close(fd);
+            }
+
+            if (commands[i].err_file != NULL) {
+                int fd;
+                fd = open(commands[i].err_file,
+                          O_WRONLY | O_CREAT | O_TRUNC,
+                          0644);
+                if (fd < 0 || dup2(fd, STDERR_FILENO) < 0) {
+                    if (fd >= 0) {
+                        close(fd);
+                    }
+                    _exit(127);
+                }
+                close(fd);
+            }
+
+            execvp(commands[i].argv[0], commands[i].argv);
+            _exit(127);
+        }
+    }
+
+    for (i = 0; i < command_count - 1; i++) {
+        close(pipe_fds[i][0]);
+        close(pipe_fds[i][1]);
+    }
+
+    for (i = 0; i < command_count; i++) {
+        int status;
+
+        if (waitpid(child_pids[i], &status, 0) < 0) {
+            continue;
+        }
+
+        if (child_pids[i] == child_pids[command_count - 1]) {
+            last_status = status;
+        }
+    }
+
+    free_tokens(tokens, token_count);
+
+    if (last_status >= 0 && WIFEXITED(last_status)) {
+        return WEXITSTATUS(last_status);
+    }
+    if (last_status >= 0 && WIFSIGNALED(last_status)) {
+        return 128 + WTERMSIG(last_status);
+    }
+    return 127;
 }
 
 static int cmd_execute(int user_id, const char *command) {
@@ -305,12 +591,10 @@ static int cmd_execute(int user_id, const char *command) {
     }
 
     if (cmd_pid == 0) {
-        /* Child process: execute the command via custom pipeline executor */
-        char cmd_copy[COMMAND_TEXT_MAX];
-        strncpy(cmd_copy, command, sizeof(cmd_copy));
-        cmd_copy[sizeof(cmd_copy)-1] = '\0';
-        execute_pipeline(cmd_copy);
-        exit(127); /* execute_pipeline shouldn't return */
+        int cmd_rc;
+
+        cmd_rc = execute_pipeline(command);
+        _exit(cmd_rc);
     } else {
         /* Parent process: wait for child to complete */
         if (waitpid(cmd_pid, &status, 0) < 0) {
@@ -377,9 +661,6 @@ static int cmd_check_status(void) {
         unlink(fifo_path);
         return 1;
     }
-
-    printf("Requesting controller status...\n");
-    fflush(stdout);
 
     if (read_full(reply_fd, &resp, sizeof(resp)) != 0) {
         print_error("Failed to receive response from controller");

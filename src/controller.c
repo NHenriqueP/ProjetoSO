@@ -40,11 +40,11 @@ typedef struct controller_state {
     int max_parallel;
     int current_running;
     int shutdown_requested;
-    int shutdown_ack_pending;
     char policy[32];
     int has_last_user;
     int last_user_id;
-    char shutdown_reply_fifo[RUNNER_FIFO_PATH_MAX];
+    int shutdown_reply_count;
+    char shutdown_reply_fifos[STATUS_MAX_ITEMS][RUNNER_FIFO_PATH_MAX];
     job_t *scheduled_head;
     job_t *scheduled_tail;
     job_t *executing_head;
@@ -121,6 +121,43 @@ static int send_response(const char *fifo_path, const response_t *resp) {
 
     close(fd);
     return 0;
+}
+
+static void enqueue_shutdown_reply_fifo(controller_state_t *state,
+                                       const char *reply_fifo) {
+    int i;
+
+    for (i = 0; i < state->shutdown_reply_count; i++) {
+        if (strcmp(state->shutdown_reply_fifos[i], reply_fifo) == 0) {
+            return;
+        }
+    }
+
+    if (state->shutdown_reply_count >= STATUS_MAX_ITEMS) {
+        return;
+    }
+
+    strncpy(state->shutdown_reply_fifos[state->shutdown_reply_count],
+            reply_fifo,
+            RUNNER_FIFO_PATH_MAX - 1);
+    state->shutdown_reply_fifos[state->shutdown_reply_count][RUNNER_FIFO_PATH_MAX - 1] =
+        '\0';
+    state->shutdown_reply_count++;
+}
+
+static void send_shutdown_acks(controller_state_t *state) {
+    response_t ack;
+    int i;
+
+    memset(&ack, 0, sizeof(ack));
+    ack.type = MSG_SHUTDOWN_ACK;
+    ack.ok = 1;
+
+    for (i = 0; i < state->shutdown_reply_count; i++) {
+        (void)send_response(state->shutdown_reply_fifos[i], &ack);
+    }
+
+    state->shutdown_reply_count = 0;
 }
 
 static job_t *create_job(const message_t *msg) {
@@ -244,6 +281,144 @@ static long long estimate_job_ms(controller_state_t *state, const job_t *job) {
     }
 
     return DEFAULT_ESTIMATE_MS;
+}
+
+static const history_entry_t *find_history_entry_ro(const controller_state_t *state,
+                                                    int user_id,
+                                                    const char *command) {
+    int i;
+
+    for (i = 0; i < HISTORY_MAX_ENTRIES; i++) {
+        if (state->history[i].used && state->history[i].user_id == user_id &&
+            strcmp(state->history[i].command, command) == 0) {
+            return &state->history[i];
+        }
+    }
+
+    return NULL;
+}
+
+static long long estimate_job_ms_ro(const controller_state_t *state,
+                                    const job_t *job) {
+    const history_entry_t *entry;
+    long long hint;
+
+    entry = find_history_entry_ro(state, job->user_id, job->command);
+    if (entry != NULL && entry->runs > 0) {
+        return entry->avg_ms;
+    }
+
+    hint = parse_sleep_hint_ms(job->command);
+    if (hint >= 0) {
+        return hint;
+    }
+
+    return DEFAULT_ESTIMATE_MS;
+}
+
+static int build_scheduled_order(const controller_state_t *state,
+                                 status_item_t scheduled[STATUS_MAX_ITEMS]) {
+    const job_t *cur;
+    const job_t **jobs;
+    unsigned char *picked;
+    int total;
+    int out_count;
+    int i;
+    int has_last_user;
+    int last_user_id;
+
+    total = 0;
+    cur = state->scheduled_head;
+    while (cur != NULL) {
+        total++;
+        cur = cur->next;
+    }
+
+    if (total == 0) {
+        return 0;
+    }
+
+    jobs = (const job_t **)calloc((size_t)total, sizeof(*jobs));
+    picked = (unsigned char *)calloc((size_t)total, sizeof(*picked));
+    if (jobs == NULL || picked == NULL) {
+        free(jobs);
+        free(picked);
+        return 0;
+    }
+
+    cur = state->scheduled_head;
+    for (i = 0; i < total; i++) {
+        jobs[i] = cur;
+        cur = cur->next;
+    }
+
+    out_count = 0;
+    has_last_user = state->has_last_user;
+    last_user_id = state->last_user_id;
+
+    while (out_count < STATUS_MAX_ITEMS && out_count < total) {
+        int pick_index;
+
+        pick_index = -1;
+
+        if (is_sjf_proxy_policy(state)) {
+            long long best_estimate;
+
+            best_estimate = 0;
+            for (i = 0; i < total; i++) {
+                if (!picked[i]) {
+                    long long estimate;
+
+                    estimate = estimate_job_ms_ro(state, jobs[i]);
+                    if (pick_index < 0 || estimate < best_estimate) {
+                        pick_index = i;
+                        best_estimate = estimate;
+                    }
+                }
+            }
+        } else if (is_rr_user_policy(state)) {
+            for (i = 0; i < total; i++) {
+                if (!picked[i] && (!has_last_user || jobs[i]->user_id != last_user_id)) {
+                    pick_index = i;
+                    break;
+                }
+            }
+            if (pick_index < 0) {
+                for (i = 0; i < total; i++) {
+                    if (!picked[i]) {
+                        pick_index = i;
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (i = 0; i < total; i++) {
+                if (!picked[i]) {
+                    pick_index = i;
+                    break;
+                }
+            }
+        }
+
+        if (pick_index < 0) {
+            break;
+        }
+
+        picked[pick_index] = 1;
+        scheduled[out_count].user_id = jobs[pick_index]->user_id;
+        scheduled[out_count].command_id = jobs[pick_index]->command_id;
+
+        if (is_rr_user_policy(state)) {
+            has_last_user = 1;
+            last_user_id = jobs[pick_index]->user_id;
+        }
+
+        out_count++;
+    }
+
+    free(jobs);
+    free(picked);
+    return out_count;
 }
 
 static void update_history(controller_state_t *state, const job_t *job, long long total_ms) {
@@ -518,15 +693,7 @@ static void build_status_response(const controller_state_t *state, response_t *r
     }
     resp->executing_count = i;
 
-    i = 0;
-    cur = state->scheduled_head;
-    while (cur != NULL && i < STATUS_MAX_ITEMS) {
-        resp->scheduled[i].user_id = cur->user_id;
-        resp->scheduled[i].command_id = cur->command_id;
-        i++;
-        cur = cur->next;
-    }
-    resp->scheduled_count = i;
+    resp->scheduled_count = build_scheduled_order(state, resp->scheduled);
 }
 
 static void schedule_jobs(controller_state_t *state) {
@@ -631,13 +798,7 @@ int main(int argc, char **argv) {
 
         schedule_jobs(&state);
         if (can_exit(&state)) {
-            if (state.shutdown_ack_pending) {
-                response_t ack;
-                memset(&ack, 0, sizeof(ack));
-                ack.type = MSG_SHUTDOWN_ACK;
-                ack.ok = 1;
-                (void)send_response(state.shutdown_reply_fifo, &ack);
-            }
+            send_shutdown_acks(&state);
             break;
         }
 
@@ -708,10 +869,7 @@ int main(int argc, char **argv) {
                 (void)send_response(msg.reply_fifo, &status);
             } else if (msg.type == MSG_SHUTDOWN_REQ) {
                 state.shutdown_requested = 1;
-                state.shutdown_ack_pending = 1;
-                strncpy(state.shutdown_reply_fifo,
-                        msg.reply_fifo,
-                        sizeof(state.shutdown_reply_fifo) - 1);
+                enqueue_shutdown_reply_fifo(&state, msg.reply_fifo);
             }
         }
     }

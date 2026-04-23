@@ -1,11 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
-
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -17,6 +17,8 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop_signal = 0;
+
+static int write_full(int fd, const void *buf, size_t len);
 
 static void on_signal(int sig) {
     (void)sig;
@@ -44,7 +46,9 @@ static int write_full(int fd, const void *buf, size_t len) {
     while (total < len) {
         ssize_t n = write(fd, p + total, len - total);
         if (n < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN) {
+                struct timespec ts = {0, 1000000}; /* 1ms */
+                nanosleep(&ts, NULL);
                 continue;
             }
             return -1;
@@ -546,8 +550,11 @@ static int cmd_execute(int user_id, const char *command) {
     strncpy(msg.reply_fifo, fifo_path, sizeof(msg.reply_fifo) - 1);
     strncpy(msg.command, command, sizeof(msg.command) - 1);
 
-    printf("[runner] command %lu submitted\n", cmd_id);
-    fflush(stdout);
+    {
+        char buf[128];
+        int msg_len = snprintf(buf, sizeof(buf), "[runner] command %lu submitted\n", cmd_id);
+        write(STDOUT_FILENO, buf, msg_len);
+    }
 
     if (send_message(&msg) < 0) {
         close(reply_fd);
@@ -580,8 +587,11 @@ static int cmd_execute(int user_id, const char *command) {
         return 1;
     }
 
-    printf("[runner] executing command %lu...\n", cmd_id);
-    fflush(stdout);
+    {
+        char buf[128];
+        int msg_len = snprintf(buf, sizeof(buf), "[runner] executing command %lu...\n", cmd_id);
+        write(STDOUT_FILENO, buf, msg_len);
+    }
 
     /* Execute the command */
     cmd_pid = fork();
@@ -614,8 +624,11 @@ static int cmd_execute(int user_id, const char *command) {
             return 1;
         }
 
-        printf("[runner] command %lu finished\n", cmd_id);
-        fflush(stdout);
+        {
+            char buf[128];
+            int msg_len = snprintf(buf, sizeof(buf), "[runner] command %lu finished\n", cmd_id);
+            write(STDOUT_FILENO, buf, msg_len);
+        }
         
         return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
     }
@@ -678,18 +691,22 @@ static int cmd_check_status(void) {
     }
 
     /* Display status */
-    printf("--Executing\n");
+    write(STDOUT_FILENO, "--Executing\n", 12);
     for (i = 0; i < resp.executing_count; i++) {
-        printf("user-id %d - command-id %lu\n", 
-               resp.executing[i].user_id, 
-               resp.executing[i].command_id);
+        char buf[128];
+        int msg_len = snprintf(buf, sizeof(buf), "user-id %d - command-id %lu\n", 
+                               resp.executing[i].user_id, 
+                               resp.executing[i].command_id);
+        write(STDOUT_FILENO, buf, msg_len);
     }
 
-    printf("--Scheduled\n");
+    write(STDOUT_FILENO, "--Scheduled\n", 12);
     for (i = 0; i < resp.scheduled_count; i++) {
-        printf("user-id %d - command-id %lu\n", 
-               resp.scheduled[i].user_id, 
-               resp.scheduled[i].command_id);
+        char buf[128];
+        int msg_len = snprintf(buf, sizeof(buf), "user-id %d - command-id %lu\n", 
+                               resp.scheduled[i].user_id, 
+                               resp.scheduled[i].command_id);
+        write(STDOUT_FILENO, buf, msg_len);
     }
 
     return 0;
@@ -735,9 +752,8 @@ static int cmd_shutdown(void) {
         return 1;
     }
 
-    printf("[runner] sent shutdown notification\n");
-    printf("[runner] waiting for controller to shutdown...\n");
-    fflush(stdout);
+    write(STDOUT_FILENO, "[runner] sent shutdown notification\n", 36);
+    write(STDOUT_FILENO, "[runner] waiting for controller to shutdown...\n", 47);
 
     if (read_full(reply_fd, &resp, sizeof(resp)) != 0) {
         print_error("Failed to receive response from controller");
@@ -755,7 +771,7 @@ static int cmd_shutdown(void) {
     }
 
     if (resp.type == MSG_SHUTDOWN_ACK) {
-        printf("[runner] controller exited.\n");
+        write(STDOUT_FILENO, "[runner] controller exited.\n", 28);
         return 0;
     }
 

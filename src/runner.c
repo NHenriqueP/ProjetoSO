@@ -1,3 +1,23 @@
+/**
+ * @file runner.c
+ * @brief Programa runner — interface do utilizador para submissão de comandos.
+ *
+ * O runner permite ao utilizador:
+ *   -e <user-id> "<comando>": submeter um comando para execução
+ *   -c:                       consultar comandos em execução e em espera
+ *   -s:                       pedir o encerramento do controller
+ *
+ * Comunicação com o controller:
+ *   - Envia pedidos para o FIFO público do controller
+ *   - Recebe respostas num FIFO privado criado por cada instância
+ *
+ * Suporte a operadores da linha de comandos:
+ *   - Pipes:                cmd1 | cmd2 | cmd3
+ *   - Redireção de entrada: cmd < ficheiro
+ *   - Redireção de saída:   cmd > ficheiro
+ *   - Redireção de stderr:  cmd 2> ficheiro
+ */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
@@ -36,6 +56,7 @@ static void print_error(const char *msg) {
     fprintf(stderr, "ERROR: %s\n", msg);
 }
 
+/* ─── Geração do caminho do FIFO privado para resposta ─── */
 static void generate_fifo_path(pid_t pid, unsigned long cmd_id, char *buffer, size_t bufsize) {
     snprintf(buffer, bufsize, "/tmp/so_runner_%d_%lu.fifo", pid, cmd_id);
 }
@@ -80,6 +101,11 @@ static int read_full(int fd, void *buf, size_t len) {
     return 0;
 }
 
+/**
+ * Gera um identificador único para o comando.
+ * Combina o PID do processo com timestamp monotónico para garantir unicidade
+ * mesmo com múltiplos runners concorrentes.
+ */
 static unsigned long generate_unique_id(pid_t pid) {
     struct timespec ts;
     uint64_t usec;
@@ -116,16 +142,21 @@ static int send_message(const message_t *msg) {
     return 0;
 }
 
-#define MAX_CMDS 20
-#define MAX_ARGS 50
-#define MAX_TOKENS 256
+/* ═══════════════════════════════════════════════════════════════════
+ * Parsing de comandos — tokenização e construção de pipeline
+ * ═══════════════════════════════════════════════════════════════════ */
 
+#define MAX_CMDS 20    /* máx. comandos num pipeline  */
+#define MAX_ARGS 50    /* máx. argumentos por comando */
+#define MAX_TOKENS 256 /* máx. tokens na tokenização  */
+
+/* Estrutura de um comando individual dentro de um pipeline. */
 typedef struct parsed_command {
-    char *argv[MAX_ARGS];
-    int argc;
-    char *in_file;
-    char *out_file;
-    char *err_file;
+    char *argv[MAX_ARGS];  /* vetor de argumentos (NULL-terminated) */
+    int argc;              /* número de argumentos                  */
+    char *in_file;         /* ficheiro para redireção de stdin      */
+    char *out_file;        /* ficheiro para redireção de stdout     */
+    char *err_file;        /* ficheiro para redireção de stderr     */
 } parsed_command_t;
 
 static void free_tokens(char *tokens[], int token_count) {
@@ -369,6 +400,12 @@ static int parse_pipeline(char *tokens[],
     return 0;
 }
 
+/**
+ * Executa um pipeline de comandos com suporte a |, <, >, 2>.
+ * Cria processos-filho para cada comando do pipeline, configurando
+ * pipes entre eles e aplicando redireções de ficheiro conforme solicitado.
+ * Retorna o exit code do último comando do pipeline.
+ */
 static int execute_pipeline(const char *cmdline) {
     parsed_command_t commands[MAX_CMDS];
     char *tokens[MAX_TOKENS];
@@ -503,6 +540,18 @@ static int execute_pipeline(const char *cmdline) {
     return 127;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Modos de operação do runner: -e, -c, -s
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Modo -e: submete um comando ao controller e executa-o após autorização.
+ * 1. Cria FIFO privado para receber resposta
+ * 2. Envia MSG_SUBMIT ao controller
+ * 3. Aguarda MSG_START
+ * 4. Executa o pipeline em processo-filho
+ * 5. Envia MSG_FINISH ao controller
+ */
 static int cmd_execute(int user_id, const char *command) {
     message_t msg;
     response_t resp;
@@ -634,6 +683,10 @@ static int cmd_execute(int user_id, const char *command) {
     }
 }
 
+/**
+ * Modo -c: consulta o estado do controller (comandos em execução e em espera).
+ * Envia MSG_STATUS_REQ e apresenta a resposta ao utilizador.
+ */
 static int cmd_check_status(void) {
     message_t msg;
     response_t resp;
@@ -712,6 +765,11 @@ static int cmd_check_status(void) {
     return 0;
 }
 
+/**
+ * Modo -s: pede o encerramento gracioso do controller.
+ * Envia MSG_SHUTDOWN_REQ e aguarda MSG_SHUTDOWN_ACK.
+ * O controller só encerra após todos os runners terminarem.
+ */
 static int cmd_shutdown(void) {
     message_t msg;
     response_t resp;

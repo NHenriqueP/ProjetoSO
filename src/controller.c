@@ -1,3 +1,19 @@
+/**
+ * @file controller.c
+ * @brief Programa controller — escalonador de comandos via named pipes.
+ *
+ * O controller recebe pedidos dos programas runner através de um FIFO
+ * público, escalona a execução dos comandos de acordo com a política
+ * configurada (FCFS, RR_USER ou SJF_PROXY) e notifica os runners quando
+ * a execução pode iniciar. Regista de forma persistente os dados de
+ * cada execução (user_id, command_id, duração) no ficheiro
+ * tmp/executions.log.
+ *
+ * Comunicação:
+ *   - FIFO público:  /tmp/so_controller_fifo  (leitura de pedidos)
+ *   - FIFOs privados: criados pelo runner para receber respostas
+ */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
@@ -14,41 +30,46 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* Número máximo de entradas no histórico de execuções (para SJF_PROXY). */
 #define HISTORY_MAX_ENTRIES 256
+/* Estimativa por defeito (ms) para comandos sem histórico. */
 #define DEFAULT_ESTIMATE_MS 1000LL
 
+/* ─── Estrutura de um job (comando submetido) ─── */
 typedef struct job {
-    int user_id;
-    unsigned long command_id;
-    pid_t runner_pid;
-    char reply_fifo[RUNNER_FIFO_PATH_MAX];
-    char command[COMMAND_TEXT_MAX];
-    struct timeval submit_ts;
-    struct timeval start_ts;
-    struct job *next;
+    int user_id;                            /* identificador do utilizador  */
+    unsigned long command_id;               /* identificador único do cmd   */
+    pid_t runner_pid;                       /* PID do runner que submeteu   */
+    char reply_fifo[RUNNER_FIFO_PATH_MAX];  /* FIFO privado para resposta   */
+    char command[COMMAND_TEXT_MAX];          /* texto do comando             */
+    struct timeval submit_ts;               /* timestamp de submissão       */
+    struct timeval start_ts;                /* timestamp de início de exec  */
+    struct job *next;                       /* próximo na lista ligada      */
 } job_t;
 
+/* ─── Histórico de execuções passadas (usado por SJF_PROXY) ─── */
 typedef struct history_entry {
-    int used;
-    int user_id;
-    char command[COMMAND_TEXT_MAX];
-    long long avg_ms;
-    unsigned long runs;
+    int used;                               /* slot ocupado?               */
+    int user_id;                            /* utilizador                  */
+    char command[COMMAND_TEXT_MAX];          /* texto do comando            */
+    long long avg_ms;                       /* duração média em ms         */
+    unsigned long runs;                     /* número de execuções         */
 } history_entry_t;
 
+/* ─── Estado global do controller ─── */
 typedef struct controller_state {
-    int max_parallel;
-    int current_running;
-    int shutdown_requested;
-    char policy[32];
-    int has_last_user;
-    int last_user_id;
-    int shutdown_reply_count;
+    int max_parallel;           /* nº máximo de comandos em paralelo      */
+    int current_running;        /* nº de comandos atualmente em execução  */
+    int shutdown_requested;     /* flag: pedido de encerramento recebido  */
+    char policy[32];            /* nome da política de escalonamento      */
+    int has_last_user;          /* flag: existe último utilizador servido */
+    int last_user_id;           /* ID do último utilizador servido (RR)   */
+    int shutdown_reply_count;   /* nº de runners à espera de shutdown ACK */
     char shutdown_reply_fifos[STATUS_MAX_ITEMS][RUNNER_FIFO_PATH_MAX];
-    job_t *scheduled_head;
-    job_t *scheduled_tail;
-    job_t *executing_head;
-    history_entry_t history[HISTORY_MAX_ENTRIES];
+    job_t *scheduled_head;      /* cabeça da fila de espera               */
+    job_t *scheduled_tail;      /* cauda da fila de espera                */
+    job_t *executing_head;      /* lista de jobs em execução              */
+    history_entry_t history[HISTORY_MAX_ENTRIES]; /* histórico SJF        */
 } controller_state_t;
 
 static volatile sig_atomic_t g_stop_signal = 0;

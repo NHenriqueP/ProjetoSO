@@ -744,7 +744,7 @@ static int cmd_check_status(void) {
     }
 
     /* Display status */
-    write(STDOUT_FILENO, "--Executing\n", 12);
+    write(STDOUT_FILENO, "---\nExecuting\n", 14);
     for (i = 0; i < resp.executing_count; i++) {
         char buf[128];
         int msg_len = snprintf(buf, sizeof(buf), "user-id %d - command-id %lu\n", 
@@ -753,7 +753,7 @@ static int cmd_check_status(void) {
         write(STDOUT_FILENO, buf, msg_len);
     }
 
-    write(STDOUT_FILENO, "--Scheduled\n", 12);
+    write(STDOUT_FILENO, "---\nScheduled\n", 14);
     for (i = 0; i < resp.scheduled_count; i++) {
         char buf[128];
         int msg_len = snprintf(buf, sizeof(buf), "user-id %d - command-id %lu\n", 

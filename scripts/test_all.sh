@@ -49,11 +49,11 @@ echo "════════════════════════�
 echo ""
 echo "── Teste 1: Execução básica de comando ──"
 rm -f /tmp/so_controller_fifo tmp/executions.log tmp/events.log
-./bin/controller 1 FCFS &
+./controller 1 FCFS &
 CTRL_PID=$!
 sleep 0.3
 
-OUTPUT=$(./bin/runner -e 1 "echo hello_world" 2>/dev/null)
+OUTPUT=$(./runner -e 1 "echo hello_world" 2>/dev/null)
 if echo "$OUTPUT" | grep -q "hello_world"; then
     pass "echo hello_world produz output correto"
 else
@@ -81,11 +81,11 @@ fi
 # ──── Teste 2: Consulta de estado ────
 echo ""
 echo "── Teste 2: Consulta de estado (-c) ──"
-./bin/runner -e 1 "sleep 2" >/dev/null 2>&1 &
+./runner -e 1 "sleep 2" >/dev/null 2>&1 &
 SLEEP_PID=$!
 sleep 0.5
 
-STATUS_OUTPUT=$(./bin/runner -c 2>/dev/null)
+STATUS_OUTPUT=$(./runner -c 2>/dev/null)
 if echo "$STATUS_OUTPUT" | grep -q "\-\-Executing"; then
     pass "secção --Executing presente"
 else
@@ -110,7 +110,7 @@ wait "$SLEEP_PID" 2>/dev/null || true
 echo ""
 echo "── Teste 3: Redireção de saída (>) ──"
 rm -f /tmp/so_test_redir_out.txt
-./bin/runner -e 1 "echo redir_test > /tmp/so_test_redir_out.txt" 2>/dev/null
+./runner -e 1 "echo redir_test > /tmp/so_test_redir_out.txt" 2>/dev/null
 if [[ -f /tmp/so_test_redir_out.txt ]] && grep -q "redir_test" /tmp/so_test_redir_out.txt; then
     pass "redireção > funciona"
 else
@@ -121,7 +121,7 @@ fi
 echo ""
 echo "── Teste 4: Redireção de entrada (<) ──"
 echo "input_data_test" > /tmp/so_test_input.txt
-OUTPUT=$(./bin/runner -e 1 "cat < /tmp/so_test_input.txt" 2>/dev/null)
+OUTPUT=$(./runner -e 1 "cat < /tmp/so_test_input.txt" 2>/dev/null)
 if echo "$OUTPUT" | grep -q "input_data_test"; then
     pass "redireção < funciona"
 else
@@ -132,7 +132,7 @@ fi
 echo ""
 echo "── Teste 5: Redireção de stderr (2>) ──"
 rm -f /tmp/so_test_stderr.txt
-./bin/runner -e 1 "ls /nonexistent_path_test_xyz 2> /tmp/so_test_stderr.txt" 2>/dev/null
+./runner -e 1 "ls /nonexistent_path_test_xyz 2> /tmp/so_test_stderr.txt" 2>/dev/null
 if [[ -f /tmp/so_test_stderr.txt ]] && [[ -s /tmp/so_test_stderr.txt ]]; then
     pass "redireção 2> funciona"
 else
@@ -142,7 +142,7 @@ fi
 # ──── Teste 6: Pipe (|) ────
 echo ""
 echo "── Teste 6: Pipe (|) ──"
-OUTPUT=$(./bin/runner -e 1 "echo hello world | wc -w" 2>/dev/null)
+OUTPUT=$(./runner -e 1 "echo hello world | wc -w" 2>/dev/null)
 if echo "$OUTPUT" | grep -q "2"; then
     pass "pipe | funciona"
 else
@@ -154,7 +154,7 @@ echo ""
 echo "── Teste 7: Pipe + Redireção combinados ──"
 echo -e "apple\nbanana\nstrawberry\nblueberry" > /tmp/so_test_fruits.txt
 rm -f /tmp/so_test_count.txt
-./bin/runner -e 1 "grep berry /tmp/so_test_fruits.txt | wc -l > /tmp/so_test_count.txt" 2>/dev/null
+./runner -e 1 "grep berry /tmp/so_test_fruits.txt | wc -l > /tmp/so_test_count.txt" 2>/dev/null
 if [[ -f /tmp/so_test_count.txt ]] && grep -q "2" /tmp/so_test_count.txt; then
     pass "pipe + redireção combinados funcionam"
 else
@@ -177,7 +177,7 @@ else
 fi
 
 # ──── Encerrar e reiniciar para teste de paralelismo ────
-./bin/runner -s >/dev/null 2>&1
+./runner -s >/dev/null 2>&1
 wait "$CTRL_PID" 2>/dev/null || true
 CTRL_PID=""
 sleep 0.3
@@ -186,14 +186,14 @@ sleep 0.3
 echo ""
 echo "── Teste 9: Execução paralela (max=2) ──"
 rm -f /tmp/so_controller_fifo tmp/executions.log tmp/events.log
-./bin/controller 2 FCFS &
+./controller 2 FCFS &
 CTRL_PID=$!
 sleep 0.3
 
 START_TIME=$(date +%s)
-./bin/runner -e 1 "sleep 1" >/dev/null 2>&1 &
+./runner -e 1 "sleep 1" >/dev/null 2>&1 &
 P1=$!
-./bin/runner -e 2 "sleep 1" >/dev/null 2>&1 &
+./runner -e 2 "sleep 1" >/dev/null 2>&1 &
 P2=$!
 wait "$P1" "$P2"
 END_TIME=$(date +%s)
@@ -208,7 +208,7 @@ fi
 # ──── Teste 10: Encerramento gracioso ────
 echo ""
 echo "── Teste 10: Encerramento gracioso (-s) ──"
-SHUTDOWN_OUTPUT=$(./bin/runner -s 2>/dev/null)
+SHUTDOWN_OUTPUT=$(./runner -s 2>/dev/null)
 if echo "$SHUTDOWN_OUTPUT" | grep -q "\[runner\] controller exited"; then
     pass "shutdown gracioso funciona"
 else
@@ -222,17 +222,17 @@ CTRL_PID=""
 echo ""
 echo "── Teste 11: Política RR_USER (max=1) ──"
 rm -f /tmp/so_controller_fifo tmp/executions.log tmp/events.log
-./bin/controller 1 RR_USER &
+./controller 1 RR_USER &
 CTRL_PID=$!
 sleep 0.3
 
-./bin/runner -e 1 "echo user1_cmd1" >/dev/null 2>&1 &
+./runner -e 1 "echo user1_cmd1" >/dev/null 2>&1 &
 P1=$!
 sleep 0.05
-./bin/runner -e 2 "echo user2_cmd1" >/dev/null 2>&1 &
+./runner -e 2 "echo user2_cmd1" >/dev/null 2>&1 &
 P2=$!
 sleep 0.05
-./bin/runner -e 1 "echo user1_cmd2" >/dev/null 2>&1 &
+./runner -e 1 "echo user1_cmd2" >/dev/null 2>&1 &
 P3=$!
 wait "$P1" "$P2" "$P3"
 
@@ -242,7 +242,7 @@ else
     fail "RR_USER não registou execuções"
 fi
 
-./bin/runner -s >/dev/null 2>&1
+./runner -s >/dev/null 2>&1
 wait "$CTRL_PID" 2>/dev/null || true
 CTRL_PID=""
 
@@ -250,14 +250,14 @@ CTRL_PID=""
 echo ""
 echo "── Teste 12: Política SJF_PROXY (max=1) ──"
 rm -f /tmp/so_controller_fifo tmp/executions.log tmp/events.log
-./bin/controller 1 SJF_PROXY &
+./controller 1 SJF_PROXY &
 CTRL_PID=$!
 sleep 0.3
 
-./bin/runner -e 1 "sleep 2" >/dev/null 2>&1 &
+./runner -e 1 "sleep 2" >/dev/null 2>&1 &
 P1=$!
 sleep 0.05
-./bin/runner -e 2 "echo fast" >/dev/null 2>&1 &
+./runner -e 2 "echo fast" >/dev/null 2>&1 &
 P2=$!
 wait "$P1" "$P2"
 
@@ -267,7 +267,7 @@ else
     fail "SJF_PROXY não registou execuções"
 fi
 
-./bin/runner -s >/dev/null 2>&1
+./runner -s >/dev/null 2>&1
 wait "$CTRL_PID" 2>/dev/null || true
 CTRL_PID=""
 

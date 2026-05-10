@@ -14,7 +14,7 @@ sleep 1
 echo "(skipping FIFO cleanup)"
 
 echo "=== Starting Controller (1 parallel, FCFS) ==="
-./bin/controller 1 FCFS &
+./controller 1 FCFS &
 CONTROLLER_PID=$!
 echo "Controller PID: $CONTROLLER_PID"
 
@@ -31,22 +31,22 @@ fi
 
 echo ""
 echo "=== Test 1: Simple command execution ==="
-./bin/runner -e 1 "echo 'Hello from runner'"
+./runner -e 1 "echo 'Hello from runner'"
 sleep 1
 
 echo ""
 echo "=== Test 2: Longer command (sleep) ==="
-./bin/runner -e 2 "sleep 2"
+./runner -e 2 "sleep 2"
 sleep 3
 
 echo ""
 echo "=== Test 3: Check status ==="
-./bin/runner -c
+./runner -c
 sleep 1
 
 echo ""
 echo "=== Test 4: Shutdown ==="
-./bin/runner -s
+./runner -s
 sleep 2
 
 echo ""

@@ -15,24 +15,24 @@ cd "$PROJ_DIR"
 sleep 1
 
 echo "=== Starting controller (1 parallel, FCFS) ==="
-./bin/controller 1 FCFS > /tmp/controller.log 2>&1 &
+./controller 1 FCFS > /tmp/controller.log 2>&1 &
 CTRL_PID=$!
 sleep 2
 
 echo "=== Test 1: Echo command ==="
-./bin/runner -e 1 "echo Hello"
+./runner -e 1 "echo Hello"
 sleep 1
 
 echo "=== Test 2: Date command ==="
-./bin/runner -e 2 "date" 
+./runner -e 2 "date" 
 sleep 1
 
 echo "=== Test 3: Status ==="
-timeout 5 ./bin/runner -c || echo "(Status timeout)"
+timeout 5 ./runner -c || echo "(Status timeout)"
 sleep 1
 
 echo "=== Test 4: Shutdown ==="
-timeout 5 ./bin/runner -s || echo "(Shutdown timeout)"
+timeout 5 ./runner -s || echo "(Shutdown timeout)"
 sleep 2
 
 echo "=== Execution Log ==="

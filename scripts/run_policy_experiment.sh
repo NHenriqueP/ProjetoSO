@@ -46,23 +46,23 @@ run_once() {
   : > tmp/executions.log
   : > tmp/events.log
 
-  ./bin/controller "$parallel" "$policy" >/tmp/controller_experiment.log 2>&1 &
+  ./controller "$parallel" "$policy" >/tmp/controller_experiment.log 2>&1 &
   controller_pid=$!
   sleep 0.2
 
   # Mixed workload with repeated user IDs to stress fairness.
-  ./bin/runner -e 1 "sleep 2" >/tmp/fr_7001.log 2>&1 & p1=$!
+  ./runner -e 1 "sleep 2" >/tmp/fr_7001.log 2>&1 & p1=$!
   sleep 0.05
-  ./bin/runner -e 1 "true" >/tmp/fr_7002.log 2>&1 & p2=$!
+  ./runner -e 1 "true" >/tmp/fr_7002.log 2>&1 & p2=$!
   sleep 0.05
-  ./bin/runner -e 2 "sleep 1" >/tmp/fr_7003.log 2>&1 & p3=$!
+  ./runner -e 2 "sleep 1" >/tmp/fr_7003.log 2>&1 & p3=$!
   sleep 0.05
-  ./bin/runner -e 3 "true" >/tmp/fr_7004.log 2>&1 & p4=$!
+  ./runner -e 3 "true" >/tmp/fr_7004.log 2>&1 & p4=$!
   sleep 0.05
-  ./bin/runner -e 2 "true" >/tmp/fr_7005.log 2>&1 & p5=$!
+  ./runner -e 2 "true" >/tmp/fr_7005.log 2>&1 & p5=$!
 
   wait "$p1" "$p2" "$p3" "$p4" "$p5"
-  ./bin/runner -s >/tmp/fr_shutdown.log 2>&1
+  ./runner -s >/tmp/fr_shutdown.log 2>&1
   wait "$controller_pid"
   controller_pid=""
 }

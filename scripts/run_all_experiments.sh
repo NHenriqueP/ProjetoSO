@@ -30,7 +30,7 @@ run_experiment() {
     rm -f /tmp/so_controller_fifo
 
     # Iniciar controller
-    ./bin/controller "$parallel" "$policy" >/dev/null 2>&1 &
+    ./controller "$parallel" "$policy" >/dev/null 2>&1 &
     local ctrl_pid=$!
     sleep 0.3
 
@@ -38,25 +38,25 @@ run_experiment() {
     # Utilizador 1: 2 comandos (sleep 2 + true)
     # Utilizador 2: 2 comandos (sleep 1 + true)
     # Utilizador 3: 1 comando  (true)
-    ./bin/runner -e 1 "sleep 2" >/dev/null 2>&1 &
+    ./runner -e 1 "sleep 2" >/dev/null 2>&1 &
     local p1=$!
     sleep 0.02
-    ./bin/runner -e 1 "true"    >/dev/null 2>&1 &
+    ./runner -e 1 "true"    >/dev/null 2>&1 &
     local p2=$!
     sleep 0.02
-    ./bin/runner -e 2 "sleep 1" >/dev/null 2>&1 &
+    ./runner -e 2 "sleep 1" >/dev/null 2>&1 &
     local p3=$!
     sleep 0.02
-    ./bin/runner -e 3 "true"    >/dev/null 2>&1 &
+    ./runner -e 3 "true"    >/dev/null 2>&1 &
     local p4=$!
     sleep 0.02
-    ./bin/runner -e 2 "true"    >/dev/null 2>&1 &
+    ./runner -e 2 "true"    >/dev/null 2>&1 &
     local p5=$!
 
     wait "$p1" "$p2" "$p3" "$p4" "$p5" 2>/dev/null
 
     # Desligar controller
-    ./bin/runner -s >/dev/null 2>&1
+    ./runner -s >/dev/null 2>&1
     wait "$ctrl_pid" 2>/dev/null || true
 
     # Calcular métricas

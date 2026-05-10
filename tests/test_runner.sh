@@ -17,7 +17,7 @@ pkill -f "bin/controller" >/dev/null 2>&1 || true
 sleep 1
 
 echo "====== Starting controller with 2 parallelism, FCFS policy ======"
-./bin/controller 2 FCFS &
+./controller 2 FCFS &
 CONTROLLER_PID=$!
 sleep 1
 
@@ -25,17 +25,17 @@ echo "====== Running test scenario ======"
 echo ""
 
 echo "Test 1: User 1 executes 'echo hello'"
-./bin/runner -e 1 "echo hello"
+./runner -e 1 "echo hello"
 sleep 0.5
 
 echo ""
 echo "Test 2: User 2 executes 'sleep 1'"
-./bin/runner -e 2 "sleep 1" &
+./runner -e 2 "sleep 1" &
 SLEEP_RUNNER_PID=$!
 sleep 0.5
 
 echo "Test 3: User 1 executes 'date'"
-./bin/runner -e 1 "date"
+./runner -e 1 "date"
 
 wait "$SLEEP_RUNNER_PID"
 
@@ -43,13 +43,13 @@ sleep 1
 
 echo ""
 echo "====== Checking controller status ======"
-./bin/runner -c || true
+./runner -c || true
 
 sleep 1
 
 echo ""
 echo "====== Shutting down controller ======"
-./bin/runner -s || true
+./runner -s || true
 
 # Wait for controller to actually exit.
 wait "$CONTROLLER_PID" 2>/dev/null || true

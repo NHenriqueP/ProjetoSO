@@ -16,7 +16,7 @@ echo "=== Step 3: Build ==="
 make >/dev/null 2>&1
 
 echo "=== Step 4: Start controller in background ==="
-./bin/controller 1 FCFS > /tmp/controller.log 2>&1 &
+./controller 1 FCFS > /tmp/controller.log 2>&1 &
 CONTROLLER_PID=$!
 echo "Controller started with PID: $CONTROLLER_PID"
 sleep 2
@@ -32,8 +32,8 @@ else
 fi
 
 echo "=== Step 6: Run first test ==="
-echo "Executing: ./bin/runner -e 1 'echo test'"
-timeout 5 ./bin/runner -e 1 "echo test" 2>&1 || echo "Runner exited with code: $?"
+echo "Executing: ./runner -e 1 'echo test'"
+timeout 5 ./runner -e 1 "echo test" 2>&1 || echo "Runner exited with code: $?"
 sleep 1
 
 echo "=== Step 7: Check controller log ==="

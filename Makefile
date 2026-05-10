@@ -3,6 +3,8 @@ CFLAGS = -Wall -Wextra -Werror -std=c11 -g -Iinclude
 LDFLAGS =
 
 all: folders controller runner
+	@ln -sf bin/controller controller
+	@ln -sf bin/runner runner
 
 controller: bin/controller
 
@@ -21,4 +23,4 @@ obj/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f obj/* tmp/* bin/*
+	rm -f obj/* tmp/* bin/* controller runner

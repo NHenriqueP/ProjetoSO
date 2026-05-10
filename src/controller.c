@@ -895,6 +895,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Libertar jobs restantes */
+    while (state.scheduled_head != NULL) {
+        job_t *tmp = state.scheduled_head;
+        state.scheduled_head = tmp->next;
+        free(tmp);
+    }
+    while (state.executing_head != NULL) {
+        job_t *tmp = state.executing_head;
+        state.executing_head = tmp->next;
+        free(tmp);
+    }
+
     close(request_fd);
     if (fifo_keepalive_fd >= 0) {
         close(fifo_keepalive_fd);
